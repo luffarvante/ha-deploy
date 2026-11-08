@@ -9,12 +9,12 @@ Minimal Home Assistant app used to validate deploy/publish plumbing
 3. Install **HA Deploy** → Start.
 4. Open **Deploy** from the sidebar (or mobile app).
 
-## Usage (v0.1)
+## Usage (v2026.1.1)
 Click **Create test file**. This writes `/config/ha-deploy-test.txt` containing `OHAI`.
 Verify the file appears in your HA config directory.
 
 ## Status
-v0.1 is a hello-world. Real deploy/publish logic is planned for v0.2+.
+v2026.1.1 is a hello-world. Real deploy/publish logic is planned for later versions.
 
 ## Credit
 Derived from [hassio-addons/addon-ssh](https://github.com/hassio-addons/addon-ssh) (MIT).
