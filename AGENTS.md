@@ -2,6 +2,11 @@
 
 Docker-based Home Assistant app (repository root). Not the HA config repo.
 
+## Remote access
+**Never SSH into any server, under any circumstances, with no exceptions.** All
+server-side inspection must come from Adrian (he runs the command and pastes the
+output).
+
 ## Memories
 Session-persistent context lives in `.opencode/memories/`. Each file is a
 markdown note named by topic. When a topic is resolved, move the file to
