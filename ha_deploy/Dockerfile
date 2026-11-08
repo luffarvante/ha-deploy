@@ -6,7 +6,7 @@ FROM ${BUILD_FROM}
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 # Install only what v1 needs
-RUN apk add --no-cache python3
+RUN apk add --no-cache python3 git openssh-client
 
 # Copy root filesystem (S6 service + app)
 COPY rootfs /

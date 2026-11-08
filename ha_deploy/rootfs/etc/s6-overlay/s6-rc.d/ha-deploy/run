@@ -2,4 +2,13 @@
 # shellcheck shell=bash
 bashio::log.info 'Starting HA Deploy web server...'
 
+# If a deploy key was placed in /share, make it available to git (mode 600).
+if [ -f /share/ha-deploy-key ]; then
+  cp /share/ha-deploy-key /data/id_ed25519
+  chmod 600 /data/id_ed25519
+  bashio::log.info 'Deploy key loaded from /share/ha-deploy-key'
+else
+  bashio::log.warning 'No deploy key at /share/ha-deploy-key - git fetch/push will fail auth'
+fi
+
 exec python3 /app/server.py
