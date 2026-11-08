@@ -2,7 +2,7 @@ import json
 import os
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-CONFIG_DIR = "/config"
+CONFIG_DIR = "/homeassistant"
 TEST_FILE = os.path.join(CONFIG_DIR, "ha-deploy-test.txt")
 PORT = 8099
 
@@ -11,7 +11,7 @@ INDEX_HTML = """<!DOCTYPE html>
 <head><meta charset="utf-8"><title>HA Deploy</title></head>
 <body>
   <h1>HA Deploy</h1>
-  <p>Click to create /config/ha-deploy-test.txt with "OHAI".</p>
+  <p>Click to create /homeassistant/ha-deploy-test.txt with "OHAI".</p>
   <button id="btn">Create test file</button>
   <pre id="out"></pre>
   <script>
@@ -65,7 +65,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path == "/create":
             try:
-                os.makedirs(CONFIG_DIR, exist_ok=True)
+                if not os.path.exists(CONFIG_DIR):
+                    raise FileNotFoundError(f"{CONFIG_DIR} not mounted")
                 with open(TEST_FILE, "w") as f:
                     f.write("OHAI\n")
                 result = {"ok": True, "path": TEST_FILE}
