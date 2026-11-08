@@ -1,5 +1,5 @@
 name: "HA Deploy"
-version: "2026.2.0"
+version: "2026.3.0"
 slug: "ha_deploy"
 description: "Minimal Home Assistant app to validate deploy/publish plumbing"
 url: "https://github.com/luffarvante/ha-deploy"
@@ -19,6 +19,9 @@ map:
     read_only: false
   - type: share
     read_only: false
+hassio_api: true
+hassio_role: manager
+homeassistant_api: true
 watchdog: "http://[HOST]:[PORT:8099]/health"
 webui: "http://[HOST]:[PORT:8099]/"
 options: {}
