@@ -296,42 +296,55 @@ class Handler(BaseHTTPRequestHandler):
         # Gate check #1
         ok, reason, st = gate_check()
         if not ok:
+            print(f"DEPLOY: gate #1 failed: {reason}", flush=True)
             return {"ok": False, "error": f"gate failed: {reason}", "status": st}
+        print("DEPLOY: gate #1 passed", flush=True)
 
         ssh_cmd = f"ssh -i {SSH_KEY} -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
         env = {"GIT_SSH_COMMAND": ssh_cmd} if os.path.exists(SSH_KEY) else {}
 
         # Trigger full backup before deploy
         backup_name = None
-        code, info = supervisor_request("POST", "/backups/new", {"name": "pre-deploy", "homeassistant": True}, timeout=300)
+        print("DEPLOY: triggering full backup", flush=True)
+        code, info = supervisor_request("POST", "/backups/new/full", {"name": "pre-deploy"}, timeout=300)
         if code == 200:
             backup_name = info.get("data", {}).get("slug") or info.get("data", {}).get("name")
+            print(f"DEPLOY: backup created slug={backup_name}", flush=True)
         else:
+            print(f"DEPLOY: backup failed code={code} info={info}", flush=True)
             return {"ok": False, "error": f"backup failed: {info}", "backup": None}
 
         core_stopped = False
         try:
             # Stop HA core
+            print("DEPLOY: stopping core", flush=True)
             code, info = supervisor_request("POST", "/core/stop", timeout=30)
             if code not in (200, 201):
+                print(f"DEPLOY: stop failed code={code} info={info}", flush=True)
                 return {"ok": False, "error": f"failed to stop core: {info}", "backup": backup_name}
             ok_stop, state = wait_for_core_state("stopped", timeout=60)
             if not ok_stop:
+                print(f"DEPLOY: core did not stop state={state}", flush=True)
                 return {"ok": False, "error": f"core did not stop (state={state})", "backup": backup_name}
             core_stopped = True
+            print("DEPLOY: core stopped", flush=True)
 
             # Gate check #2 (re-check after stop)
             ok2, reason2, st2 = gate_check()
             if not ok2:
-                # restart core before returning
+                print(f"DEPLOY: post-stop gate failed: {reason2}", flush=True)
                 supervisor_request("POST", "/core/start", timeout=30)
                 wait_for_core_state("running", timeout=60)
                 return {"ok": False, "error": f"post-stop gate failed: {reason2}", "status": st2, "backup": backup_name}
+            print("DEPLOY: post-stop gate passed", flush=True)
 
             # Git pull
+            print("DEPLOY: running git pull", flush=True)
             rc, out, err = run_git(["pull"], env=env)
             pull_output = (out + ("\n" + err if err else "")).strip()
+            print(f"DEPLOY: git pull rc={rc} output={pull_output!r}", flush=True)
             if rc != 0 or "CONFLICT" in (out + err) or "error:" in (out + err).lower():
+                print("DEPLOY: git pull failed, restarting core", flush=True)
                 supervisor_request("POST", "/core/start", timeout=30)
                 wait_for_core_state("running", timeout=60)
                 return {"ok": False, "error": "git pull failed", "pull_output": pull_output, "backup": backup_name}
@@ -340,24 +353,31 @@ class Handler(BaseHTTPRequestHandler):
             rc2, status_out, _ = run_git(["status", "--porcelain"])
             modified = [l for l in status_out.splitlines() if l.strip() and not l.startswith("??")]
             if modified:
+                print(f"DEPLOY: unexpected tracked changes after pull: {modified}", flush=True)
                 supervisor_request("POST", "/core/start", timeout=30)
                 wait_for_core_state("running", timeout=60)
                 return {"ok": False, "error": "unexpected tracked changes after pull",
                         "modified": modified, "pull_output": pull_output, "backup": backup_name}
+            print("DEPLOY: post-pull verify ok", flush=True)
 
             # Start HA core
+            print("DEPLOY: starting core", flush=True)
             code, info = supervisor_request("POST", "/core/start", timeout=30)
             if code not in (200, 201):
+                print(f"DEPLOY: start failed code={code} info={info}", flush=True)
                 return {"ok": False, "error": f"failed to start core: {info}", "pull_output": pull_output, "backup": backup_name}
             ok_start, state = wait_for_core_state("running", timeout=90)
             if not ok_start:
+                print(f"DEPLOY: core did not start state={state}", flush=True)
                 return {"ok": False, "error": f"core did not start (state={state})", "pull_output": pull_output, "backup": backup_name}
+            print("DEPLOY: core started successfully", flush=True)
 
             core_stopped = False
             return {"ok": True, "pull_output": pull_output, "backup": backup_name, "started": True}
 
         finally:
             if core_stopped:
+                print("DEPLOY: finally - restarting core", flush=True)
                 supervisor_request("POST", "/core/start", timeout=30)
                 wait_for_core_state("running", timeout=90)
 

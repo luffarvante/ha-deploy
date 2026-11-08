@@ -1,5 +1,5 @@
 name: "HA Deploy"
-version: "2026.3.0"
+version: "2026.3.1"
 slug: "ha_deploy"
 description: "Minimal Home Assistant app to validate deploy/publish plumbing"
 url: "https://github.com/luffarvante/ha-deploy"
