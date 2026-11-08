@@ -2,7 +2,7 @@ name: "HA Deploy"
 version: "0.1.0"
 slug: "ha_deploy"
 description: "Minimal Home Assistant app to validate deploy/publish plumbing"
-url: "https://github.com/luffarvante/ha-deploy-app"
+url: "https://github.com/luffarvante/ha-deploy"
 arch:
   - aarch64
   - amd64
