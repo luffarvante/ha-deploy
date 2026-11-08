@@ -10,7 +10,7 @@ INDEX_HTML = """<!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"><title>HA Deploy</title></head>
 <body>
-  <h1>HA Deploy v0.1</h1>
+  <h1>HA Deploy</h1>
   <p>Click to create /config/ha-deploy-test.txt with "OHAI".</p>
   <button id="btn">Create test file</button>
   <pre id="out"></pre>
@@ -40,6 +40,17 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b"ok")
             return
+        if self.path == "/debug":
+            info = {"root": sorted(os.listdir("/")), "config_exists": os.path.exists(CONFIG_DIR)}
+            if os.path.exists(CONFIG_DIR):
+                info["config_contents"] = sorted(os.listdir(CONFIG_DIR))
+            data = json.dumps(info, indent=2).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if self.path == "/":
             data = INDEX_HTML.encode()
             self.send_response(200)
@@ -54,11 +65,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path == "/create":
             try:
+                os.makedirs(CONFIG_DIR, exist_ok=True)
                 with open(TEST_FILE, "w") as f:
                     f.write("OHAI\n")
                 result = {"ok": True, "path": TEST_FILE}
             except Exception as e:
-                result = {"ok": False, "error": str(e)}
+                result = {"ok": False, "error": str(e), "root": sorted(os.listdir("/")),
+                          "config_exists": os.path.exists(CONFIG_DIR)}
             data = json.dumps(result).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -70,7 +83,6 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def log_message(self, fmt, *args):
-        # keep logs quiet
         pass
 
 
