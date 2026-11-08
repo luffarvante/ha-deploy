@@ -16,9 +16,15 @@ INDEX_HTML = """<!DOCTYPE html>
   <pre id="out"></pre>
   <script>
     document.getElementById('btn').onclick = async () => {
-      const r = await fetch('/create', { method: 'POST' });
-      const j = await r.json();
-      document.getElementById('out').textContent = JSON.stringify(j, null, 2);
+      const out = document.getElementById('out');
+      out.textContent = 'Working...';
+      try {
+        const r = await fetch('create', { method: 'POST' });
+        const j = await r.json();
+        out.textContent = JSON.stringify(j, null, 2);
+      } catch (e) {
+        out.textContent = 'Error: ' + e;
+      }
     };
   </script>
 </body>
