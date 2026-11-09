@@ -82,14 +82,14 @@ def status():
 def git_fetch_check():
     # ToNote: copy-paste from `#gate_check`
     """Return (ok, reason, status_dict)."""
-    st = git_status_summary()
+    st, env = git_status_summary()
     if not st["fetch_ok"]:
-        return False, f"fetch failed: {st['fetch_error']}", st
+        return False, f"fetch failed: {st['fetch_error']}", st, None
     if st["ahead"] > 0:
-        return False, "local is ahead of origin (unpushed commits) - resolve manually or publish first", st
+        return False, "local is ahead of origin (unpushed commits) - resolve manually or publish first", st, None
     if any(c["status"] != "??" for c in st["changes"]):
-        return False, "modified tracked files present - resolve manually first", st
-    return True, "clean", st
+        return False, "modified tracked files present - resolve manually first", st, None
+    return True, "clean", st, env
 
 
 
@@ -157,7 +157,7 @@ def git_status_summary():
         "changes": changes,
         "summary": summary,
         "gate_ok": gate_ok,
-    }
+    }, env
 
 GIT_DIR = "/homeassistant"
 
@@ -180,7 +180,7 @@ def do_deploy():
     # ToNote: real script logs we are starting
     print("STEP 1: Git fetch check before anything else")
     pre_check = git_fetch_check()
-    pc_ok, pc_reason, pc_st = pre_check
+    pc_ok, pc_reason, pc_st, env = pre_check
     if not pc_ok:
         print("ERROR git fetch check is big fail")
         print("  reason:", pc_reason)
@@ -197,7 +197,7 @@ def do_deploy():
 
     print("\nSTEP 3: Stop HA core")
     after_stop_check = git_fetch_check()
-    asc_ok, asc_reason, asc_st = after_stop_check
+    asc_ok, asc_reason, asc_st, env = after_stop_check
     print("after stop check: (is_ok: {}, reason: {}, status: {})".format(asc_ok, pc_reason, pc_st))
     if not asc_ok:
         print("FAIL FAIL!")
@@ -208,7 +208,7 @@ def do_deploy():
         return "FAIL"
 
     print("after sync check was fine!")
-    pull_result, debugerry = git_pull()
+    pull_result, debugerry = git_pull(env)
     print("pull result:", pull_result)
     if not pull_result:
         print("FAIL!!")
@@ -227,7 +227,7 @@ def do_deploy():
 
 SSH_KEY = "/data/id_ed25519"
 
-def git_pull():
+def git_pull(env):
     print("DEPLOY: running git pull", flush=True)
     rc, out, err = run_git(["pull"], env=env)
     pull_output = (out + ("\n" + err if err else "")).strip()
@@ -238,7 +238,7 @@ def git_pull():
         wait_for_core_state("running", timeout=60)
         return False, {"ok": False, "error": "git pull failed", "pull_output": pull_output, "backup": backup_name}
 
-    rc2, status_out, _ = run_git(["status", "--porcelain"])
+    rc2, status_out, _ = run_git(["status", "--porcelain"], env=env)
     modified = [l for l in status_out.splitlines() if l.strip() and not l.startswith("??")]
     if modified:
         print(f"DEPLOY: unexpected tracked changes after pull: {modified}", flush=True)
