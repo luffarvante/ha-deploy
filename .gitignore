@@ -7,3 +7,7 @@ __pycache__/
 
 # Local-only agent context (never tracked)
 .opencode/
+
+
+.idea
+
