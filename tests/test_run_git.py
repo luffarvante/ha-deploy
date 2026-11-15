@@ -1,4 +1,5 @@
 """Tests for run_git (rc/exception mapping) and derive_git_env (silent fallback)."""
+
 import deploy
 
 
@@ -56,8 +57,7 @@ def test_derive_git_env_with_key_present(monkeypatch):
     monkeypatch.setattr(deploy.os.path, "exists", lambda path: True)
     env = deploy.derive_git_env()
     assert env["GIT_SSH_COMMAND"] == (
-        "ssh -i /data/id_ed25519 "
-        "-o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+        "ssh -i /data/id_ed25519 -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
     )
 
 

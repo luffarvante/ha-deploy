@@ -1,14 +1,21 @@
+"""HA Deploy app: status check, deploy endpoint, ingress UI.
+
+The live deploy implementation lives in deploy.py; this file keeps the HTTP
+server, routes, and the superseded v2b deploy code (removed after the new
+module is validated on the server).
+"""
+
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
+import logging
 import os
 import re
 import subprocess
 import time
-import urllib.request
 import urllib.error
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import urllib.request
 
 import deploy as deploy_module
-import logging
 
 logging.basicConfig(format="%(levelname)s: %(message)s", level=logging.INFO)
 
@@ -23,24 +30,32 @@ SUPERVISOR_TOKEN = os.environ.get("SUPERVISOR_TOKEN", "")
 # rather than 500ing on every page load.
 _INDEX_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html")
 try:
-    with open(_INDEX_FILE, "r", encoding="utf-8") as f:
+    with open(_INDEX_FILE, encoding="utf-8") as f:
         INDEX_HTML = f.read()
 except OSError as e:
-    raise SystemExit(f"index.html missing next to server.py: {e}")
+    raise SystemExit(f"index.html missing next to server.py: {e}") from e
 
 
 def run_git(args, env=None):
+    """Run git in GIT_DIR. Returns (rc, stdout, stderr); never raises."""
     e = dict(os.environ)
     if env:
         e.update(env)
     try:
-        r = subprocess.run(["git", "-C", GIT_DIR] + args, capture_output=True, text=True, env=e, timeout=60)
+        r = subprocess.run(
+            ["git", "-C", GIT_DIR, *args],
+            capture_output=True,
+            text=True,
+            env=e,
+            timeout=60,
+        )
         return r.returncode, r.stdout.strip(), r.stderr.strip()
     except Exception as ex:
         return -1, "", str(ex)
 
 
 def supervisor_request(method, path, data=None, timeout=30):
+    """Defensive Supervisor API call: returns (code, parsed body); never raises."""
     url = f"{SUPERVISOR}{path}"
     headers = {"Authorization": f"Bearer {SUPERVISOR_TOKEN}"}
     body = None
@@ -76,21 +91,21 @@ def wait_for_core_state(target, timeout=60):
 
 
 def git_status_summary():
+    """Fetch + status -b; classifies the state (legacy copy; see deploy.py)."""
     ssh_cmd = f"ssh -i {SSH_KEY} -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
     env = {"GIT_SSH_COMMAND": ssh_cmd} if os.path.exists(SSH_KEY) else {}
 
-    rc, out, err = run_git(["fetch", "origin"], env=env)
-    fetch_ok = (rc == 0)
+    rc, _out, err = run_git(["fetch", "origin"], env=env)
+    fetch_ok = rc == 0
     fetch_error = err if not fetch_ok else ""
 
-    rc2, branch_out, _ = run_git(["status", "--porcelain=v1", "-b"])
+    _rc2, branch_out, _ = run_git(["status", "--porcelain=v1", "-b"])
     branch = ""
     ahead = behind = 0
     changes = []
     for line in branch_out.splitlines():
         if line.startswith("##"):
             branch = line[2:].strip()
-            import re
             m = re.search(r"ahead (\d+)", line)
             if m:
                 ahead = int(m.group(1))
@@ -102,7 +117,12 @@ def git_status_summary():
 
     if not fetch_ok:
         low = fetch_error.lower()
-        if "permission" in low or "auth" in low or "host key" in low or "could not read" in low:
+        if (
+            "permission" in low
+            or "auth" in low
+            or "host key" in low
+            or "could not read" in low
+        ):
             summary = "auth error"
         else:
             summary = "fetch failed"
@@ -146,14 +166,21 @@ def gate_check():
     if not st["fetch_ok"]:
         return False, f"fetch failed: {st['fetch_error']}", st
     if st["ahead"] > 0:
-        return False, "local is ahead of origin (unpushed commits) - resolve manually or publish first", st
+        return (
+            False,
+            "local is ahead of origin (unpushed commits) - resolve manually or publish first",
+            st,
+        )
     if any(c["status"] != "??" for c in st["changes"]):
         return False, "modified tracked files present - resolve manually first", st
     return True, "clean", st
 
 
 class Handler(BaseHTTPRequestHandler):
+    """HTTP routes for the UI, status checks, and the deploy trigger."""
+
     def do_GET(self):
+        """Route GET: /health, /debug, /status, /."""
         if self.path == "/health":
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
@@ -161,8 +188,11 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(b"ok")
             return
         if self.path == "/debug":
-            info = {"root": sorted(os.listdir("/")), "homeassistant_exists": os.path.exists(GIT_DIR),
-                    "ssh_key_exists": os.path.exists(SSH_KEY)}
+            info = {
+                "root": sorted(os.listdir("/")),
+                "homeassistant_exists": os.path.exists(GIT_DIR),
+                "ssh_key_exists": os.path.exists(SSH_KEY),
+            }
             if os.path.exists(GIT_DIR):
                 info["homeassistant_contents"] = sorted(os.listdir(GIT_DIR))
             data = json.dumps(info, indent=2).encode()
@@ -193,15 +223,17 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self):
+        """Route POST: /create, /deploy."""
         if self.path == "/create":
-            try:
-                if not os.path.exists(GIT_DIR):
-                    raise FileNotFoundError(f"{GIT_DIR} not mounted")
-                with open(TEST_FILE, "w") as f:
-                    f.write("OHAI\n")
-                result = {"ok": True, "path": TEST_FILE}
-            except Exception as e:
-                result = {"ok": False, "error": str(e)}
+            if not os.path.exists(GIT_DIR):
+                result = {"ok": False, "error": f"{GIT_DIR} not mounted"}
+            else:
+                try:
+                    with open(TEST_FILE, "w") as f:
+                        f.write("OHAI\n")
+                    result = {"ok": True, "path": TEST_FILE}
+                except Exception as e:
+                    result = {"ok": False, "error": str(e)}
             data = json.dumps(result).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -217,7 +249,7 @@ class Handler(BaseHTTPRequestHandler):
                 result = deploy_module.deploy()
             except Exception as e:
                 logging.getLogger(__name__).exception(
-                    "DEPLOY: unexpected error (last-resort catch): %r", e
+                    "DEPLOY: unexpected error (last-resort catch)"
                 )
                 result = {"ok": False, "error": f"unexpected server error: {e!r}"}
             data = json.dumps(result).encode()
@@ -232,6 +264,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _do_deploy(self):
+        """Superseded v2b deploy implementation; /deploy uses deploy.py now."""
         # Gate check #1
         ok, reason, st = gate_check()
         if not ok:
@@ -239,15 +272,21 @@ class Handler(BaseHTTPRequestHandler):
             return {"ok": False, "error": f"gate failed: {reason}", "status": st}
         print("DEPLOY: gate #1 passed", flush=True)
 
-        ssh_cmd = f"ssh -i {SSH_KEY} -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+        ssh_cmd = (
+            f"ssh -i {SSH_KEY} -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+        )
         env = {"GIT_SSH_COMMAND": ssh_cmd} if os.path.exists(SSH_KEY) else {}
 
         # Trigger full backup before deploy
         backup_name = None
         print("DEPLOY: triggering full backup", flush=True)
-        code, info = supervisor_request("POST", "/backups/new/full", {"name": "pre-deploy"}, timeout=300)
+        code, info = supervisor_request(
+            "POST", "/backups/new/full", {"name": "pre-deploy"}, timeout=300
+        )
         if code == 200:
-            backup_name = info.get("data", {}).get("slug") or info.get("data", {}).get("name")
+            backup_name = info.get("data", {}).get("slug") or info.get("data", {}).get(
+                "name"
+            )
             print(f"DEPLOY: backup created slug={backup_name}", flush=True)
         else:
             print(f"DEPLOY: backup failed code={code} info={info}", flush=True)
@@ -260,11 +299,19 @@ class Handler(BaseHTTPRequestHandler):
             code, info = supervisor_request("POST", "/core/stop", timeout=30)
             if code not in (200, 201):
                 print(f"DEPLOY: stop failed code={code} info={info}", flush=True)
-                return {"ok": False, "error": f"failed to stop core: {info}", "backup": backup_name}
+                return {
+                    "ok": False,
+                    "error": f"failed to stop core: {info}",
+                    "backup": backup_name,
+                }
             ok_stop, state = wait_for_core_state("stopped", timeout=60)
             if not ok_stop:
                 print(f"DEPLOY: core did not stop state={state}", flush=True)
-                return {"ok": False, "error": f"core did not stop (state={state})", "backup": backup_name}
+                return {
+                    "ok": False,
+                    "error": f"core did not stop (state={state})",
+                    "backup": backup_name,
+                }
             core_stopped = True
             print("DEPLOY: core stopped", flush=True)
 
@@ -274,7 +321,12 @@ class Handler(BaseHTTPRequestHandler):
                 print(f"DEPLOY: post-stop gate failed: {reason2}", flush=True)
                 supervisor_request("POST", "/core/start", timeout=30)
                 wait_for_core_state("running", timeout=60)
-                return {"ok": False, "error": f"post-stop gate failed: {reason2}", "status": st2, "backup": backup_name}
+                return {
+                    "ok": False,
+                    "error": f"post-stop gate failed: {reason2}",
+                    "status": st2,
+                    "backup": backup_name,
+                }
             print("DEPLOY: post-stop gate passed", flush=True)
 
             # Git pull
@@ -286,17 +338,34 @@ class Handler(BaseHTTPRequestHandler):
                 print("DEPLOY: git pull failed, restarting core", flush=True)
                 supervisor_request("POST", "/core/start", timeout=30)
                 wait_for_core_state("running", timeout=60)
-                return {"ok": False, "error": "git pull failed", "pull_output": pull_output, "backup": backup_name}
+                return {
+                    "ok": False,
+                    "error": "git pull failed",
+                    "pull_output": pull_output,
+                    "backup": backup_name,
+                }
 
             # Post-pull verify
-            rc2, status_out, _ = run_git(["status", "--porcelain"])
-            modified = [l for l in status_out.splitlines() if l.strip() and not l.startswith("??")]
+            _rc2, status_out, _ = run_git(["status", "--porcelain"])
+            modified = [
+                entry
+                for entry in status_out.splitlines()
+                if entry.strip() and not entry.startswith("??")
+            ]
             if modified:
-                print(f"DEPLOY: unexpected tracked changes after pull: {modified}", flush=True)
+                print(
+                    f"DEPLOY: unexpected tracked changes after pull: {modified}",
+                    flush=True,
+                )
                 supervisor_request("POST", "/core/start", timeout=30)
                 wait_for_core_state("running", timeout=60)
-                return {"ok": False, "error": "unexpected tracked changes after pull",
-                        "modified": modified, "pull_output": pull_output, "backup": backup_name}
+                return {
+                    "ok": False,
+                    "error": "unexpected tracked changes after pull",
+                    "modified": modified,
+                    "pull_output": pull_output,
+                    "backup": backup_name,
+                }
             print("DEPLOY: post-pull verify ok", flush=True)
 
             # Start HA core
@@ -304,15 +373,30 @@ class Handler(BaseHTTPRequestHandler):
             code, info = supervisor_request("POST", "/core/start", timeout=30)
             if code not in (200, 201):
                 print(f"DEPLOY: start failed code={code} info={info}", flush=True)
-                return {"ok": False, "error": f"failed to start core: {info}", "pull_output": pull_output, "backup": backup_name}
+                return {
+                    "ok": False,
+                    "error": f"failed to start core: {info}",
+                    "pull_output": pull_output,
+                    "backup": backup_name,
+                }
             ok_start, state = wait_for_core_state("running", timeout=90)
             if not ok_start:
                 print(f"DEPLOY: core did not start state={state}", flush=True)
-                return {"ok": False, "error": f"core did not start (state={state})", "pull_output": pull_output, "backup": backup_name}
+                return {
+                    "ok": False,
+                    "error": f"core did not start (state={state})",
+                    "pull_output": pull_output,
+                    "backup": backup_name,
+                }
             print("DEPLOY: core started successfully", flush=True)
 
             core_stopped = False
-            return {"ok": True, "pull_output": pull_output, "backup": backup_name, "started": True}
+            return {
+                "ok": True,
+                "pull_output": pull_output,
+                "backup": backup_name,
+                "started": True,
+            }
 
         finally:
             if core_stopped:
@@ -321,7 +405,7 @@ class Handler(BaseHTTPRequestHandler):
                 wait_for_core_state("running", timeout=90)
 
     def log_message(self, fmt, *args):
-        pass
+        """Silence default per-request access logging."""
 
 
 if __name__ == "__main__":

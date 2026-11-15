@@ -1,4 +1,5 @@
 """Make the app module importable for tests (app lives outside tests/)."""
+
 import os
 import sys
 

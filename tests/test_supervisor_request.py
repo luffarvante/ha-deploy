@@ -1,4 +1,5 @@
 """Mapping tests for supervisor_request (defensive wrapper, never raises)."""
+
 import io
 import json
 import urllib.error
@@ -49,7 +50,7 @@ def test_post_data_is_sent_as_json(monkeypatch):
         return ok_200()
 
     monkeypatch.setattr(deploy.urllib.request, "urlopen", fake_urlopen)
-    code, info = deploy.supervisor_request("POST", "/test", {"name": "x"})
+    code, _info = deploy.supervisor_request("POST", "/test", {"name": "x"})
     assert code == 200
     assert json.loads(captured["data"]) == {"name": "x"}
     assert captured["content_type"] == "application/json"

@@ -29,14 +29,15 @@ Outcome mapping references (see plan):
     fails and surfaces as an ordinary fetch/auth error.
 """
 
+import contextlib
 import json
 import logging
 import os
 import re
 import subprocess
-import urllib.request
-import urllib.error
 from typing import Any, TypedDict
+import urllib.error
+import urllib.request
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -52,11 +53,15 @@ BACKUP_NAME = "pre-deploy"
 
 
 class ChangeDict(TypedDict):
+    """One line of `git status --porcelain` output."""
+
     status: str
     path: str
 
 
 class StatusSummary(TypedDict):
+    """Result of git_status_summary: state classification + gate verdict."""
+
     fetch_ok: bool
     fetch_error: str
     status_ok: bool
@@ -70,6 +75,8 @@ class StatusSummary(TypedDict):
 
 
 class BackupResult(TypedDict):
+    """Result of create_backup."""
+
     ok: bool
     slug: str | None
     code: int
@@ -77,6 +84,8 @@ class BackupResult(TypedDict):
 
 
 class ControlResult(TypedDict):
+    """Result of stop_core / start_core."""
+
     ok: bool
     code: int
     error: str | None
@@ -84,6 +93,8 @@ class ControlResult(TypedDict):
 
 
 class PullResult(TypedDict):
+    """Result of pull."""
+
     ok: bool
     rc: int
     pull_output: str
@@ -91,6 +102,8 @@ class PullResult(TypedDict):
 
 
 class VerifyResult(TypedDict):
+    """Result of verify."""
+
     ok: bool
     modified: list[str]
     error: str | None
@@ -121,10 +134,8 @@ def supervisor_request(
             raw: str = resp.read().decode(errors="replace")
     except urllib.error.HTTPError as e:
         raw = ""
-        try:
+        with contextlib.suppress(Exception):
             raw = e.read().decode(errors="replace")
-        except Exception:
-            pass
         try:
             parsed: dict[str, Any] = json.loads(raw)
         except Exception:
@@ -146,8 +157,11 @@ def run_git(args: list[str], env: dict[str, str] | None = None) -> tuple[int, st
         e.update(env)
     try:
         r = subprocess.run(
-            ["git", "-C", GIT_DIR] + args,
-            capture_output=True, text=True, env=e, timeout=60,
+            ["git", "-C", GIT_DIR, *args],
+            capture_output=True,
+            text=True,
+            env=e,
+            timeout=60,
         )
         return r.returncode, r.stdout.strip(), r.stderr.strip()
     except Exception as ex:
@@ -168,13 +182,13 @@ def derive_git_env() -> dict[str, str]:
 
 
 def git_status_summary(env: dict[str, str]) -> StatusSummary:
-    """git fetch origin + git status --porcelain=v1 -b; classifies the state."""
-    rc, out, err = run_git(["fetch", "origin"], env=env)
-    fetch_ok = (rc == 0)
+    """Git fetch origin + git status --porcelain=v1 -b; classifies the state."""
+    rc, _out, err = run_git(["fetch", "origin"], env=env)
+    fetch_ok = rc == 0
     fetch_error = err if not fetch_ok else ""
 
     rc2, branch_out, err2 = run_git(["status", "--porcelain=v1", "-b"], env=env)
-    status_ok = (rc2 == 0)
+    status_ok = rc2 == 0
     status_error = err2 if not status_ok else ""
     branch = ""
     ahead = 0
@@ -195,7 +209,12 @@ def git_status_summary(env: dict[str, str]) -> StatusSummary:
     summary: str
     if not fetch_ok:
         low = fetch_error.lower()
-        if "permission" in low or "auth" in low or "host key" in low or "could not read" in low:
+        if (
+            "permission" in low
+            or "auth" in low
+            or "host key" in low
+            or "could not read" in low
+        ):
             summary = "auth error"
         else:
             summary = "fetch failed"
@@ -222,7 +241,8 @@ def git_status_summary(env: dict[str, str]) -> StatusSummary:
 
     # gate: deploy allowed only if fetch_ok, status_ok, ahead==0, no modified tracked files
     gate_ok = (
-        fetch_ok and status_ok
+        fetch_ok
+        and status_ok
         and ahead == 0
         and not any(c["status"] != "??" for c in changes)
     )
@@ -252,7 +272,11 @@ def gate_check(env: dict[str, str]) -> tuple[bool, str, StatusSummary]:
     if not st["status_ok"]:
         return False, f"status failed: {st['status_error']}", st
     if st["ahead"] > 0:
-        return False, "local is ahead of origin (unpushed commits) - resolve manually or publish first", st
+        return (
+            False,
+            "local is ahead of origin (unpushed commits) - resolve manually or publish first",
+            st,
+        )
     if any(c["status"] != "??" for c in st["changes"]):
         return False, "modified tracked files present - resolve manually first", st
     return True, "clean", st
@@ -279,9 +303,7 @@ def create_backup() -> BackupResult:
             return result
         data = info.get("data") if isinstance(info, dict) else None
         slug = (
-            (data.get("slug") or data.get("name"))
-            if isinstance(data, dict)
-            else None
+            (data.get("slug") or data.get("name")) if isinstance(data, dict) else None
         )
         if not slug:
             result["error"] = f"backup API returned unexpected body (no slug): {info}"
@@ -342,7 +364,7 @@ def start_core() -> ControlResult:
 
 
 def pull(env: dict[str, str]) -> PullResult:
-    """git pull. rc=0 AND no CONFLICT AND no error: in output -> ok.
+    """Git pull. rc=0 AND no CONFLICT AND no error: in output -> ok.
 
     Returns {"ok", "rc", "pull_output", "error"}.
     """
@@ -377,7 +399,11 @@ def verify(env: dict[str, str]) -> VerifyResult:
             result["error"] = f"git status failed rc={rc}: {err}"
             _LOGGER.error("DEPLOY: verify failed: %s", result["error"])
             return result
-        modified = [l for l in out.splitlines() if l.strip() and not l.startswith("??")]
+        modified = [
+            entry
+            for entry in out.splitlines()
+            if entry.strip() and not entry.startswith("??")
+        ]
         if modified:
             result["modified"] = modified
             result["error"] = "unexpected tracked changes after pull"
@@ -426,10 +452,17 @@ def deploy() -> dict[str, Any]:
         _LOGGER.info("DEPLOY: stopping ha core")
         s = stop_core()
         _LOGGER.info(
-            "DEPLOY: stop result: ok=%s code=%s error=%s", s["ok"], s["code"], s["error"]
+            "DEPLOY: stop result: ok=%s code=%s error=%s",
+            s["ok"],
+            s["code"],
+            s["error"],
         )
         if not s["ok"]:
-            return {"ok": False, "error": f"failed to stop core: {s['error']}", "backup": backup_slug}
+            return {
+                "ok": False,
+                "error": f"failed to stop core: {s['error']}",
+                "backup": backup_slug,
+            }
         # Set immediately after a successful stop, BEFORE anything else, so any
         # exception further down still triggers the finally restart.
         core_stopped = True
@@ -437,9 +470,7 @@ def deploy() -> dict[str, Any]:
         # Step 4: after-stop gate check (gate #2). Fail -> start, return.
         _LOGGER.info("DEPLOY: running after-stop check (gate #2)")
         ok2, reason2, st2 = gate_check(env)
-        _LOGGER.info(
-            "DEPLOY: after-stop check result: ok=%s reason=%s", ok2, reason2
-        )
+        _LOGGER.info("DEPLOY: after-stop check result: ok=%s reason=%s", ok2, reason2)
         if not ok2:
             _LOGGER.error(
                 "DEPLOY: after-stop check was not fine, will return error "
@@ -448,9 +479,16 @@ def deploy() -> dict[str, Any]:
             r = start_core()
             _LOGGER.info(
                 "DEPLOY: restart result: ok=%s code=%s error=%s",
-                r["ok"], r["code"], r["error"],
+                r["ok"],
+                r["code"],
+                r["error"],
             )
-            return {"ok": False, "error": f"post-stop gate failed: {reason2}", "status": st2, "backup": backup_slug}
+            return {
+                "ok": False,
+                "error": f"post-stop gate failed: {reason2}",
+                "status": st2,
+                "backup": backup_slug,
+            }
 
         # Step 5: git pull. Fail -> start, return.
         p = pull(env)
@@ -463,9 +501,16 @@ def deploy() -> dict[str, Any]:
             r = start_core()
             _LOGGER.info(
                 "DEPLOY: restart result: ok=%s code=%s error=%s",
-                r["ok"], r["code"], r["error"],
+                r["ok"],
+                r["code"],
+                r["error"],
             )
-            return {"ok": False, "error": "git pull failed", "pull_output": p["pull_output"], "backup": backup_slug}
+            return {
+                "ok": False,
+                "error": "git pull failed",
+                "pull_output": p["pull_output"],
+                "backup": backup_slug,
+            }
 
         # Step 6: post-pull verify. Fail -> start, return.
         v = verify(env)
@@ -478,24 +523,43 @@ def deploy() -> dict[str, Any]:
             r = start_core()
             _LOGGER.info(
                 "DEPLOY: restart result: ok=%s code=%s error=%s",
-                r["ok"], r["code"], r["error"],
+                r["ok"],
+                r["code"],
+                r["error"],
             )
-            return {"ok": False, "error": "unexpected tracked changes after pull",
-                    "modified": v["modified"], "pull_output": p["pull_output"], "backup": backup_slug}
+            return {
+                "ok": False,
+                "error": "unexpected tracked changes after pull",
+                "modified": v["modified"],
+                "pull_output": p["pull_output"],
+                "backup": backup_slug,
+            }
 
         # Step 7: start HA core. Fail -> return; core stays stopped and the
         # finally will still attempt a start.
         _LOGGER.info("DEPLOY: starting ha core")
         f = start_core()
         _LOGGER.info(
-            "DEPLOY: start result: ok=%s code=%s error=%s", f["ok"], f["code"], f["error"]
+            "DEPLOY: start result: ok=%s code=%s error=%s",
+            f["ok"],
+            f["code"],
+            f["error"],
         )
         if not f["ok"]:
-            return {"ok": False, "error": f"failed to start core: {f['error']}",
-                    "pull_output": p["pull_output"], "backup": backup_slug}
+            return {
+                "ok": False,
+                "error": f"failed to start core: {f['error']}",
+                "pull_output": p["pull_output"],
+                "backup": backup_slug,
+            }
         core_stopped = False
         _LOGGER.info("DEPLOY: ===== deploy finished OK =====")
-        return {"ok": True, "pull_output": p["pull_output"], "backup": backup_slug, "started": True}
+        return {
+            "ok": True,
+            "pull_output": p["pull_output"],
+            "backup": backup_slug,
+            "started": True,
+        }
 
     finally:
         # Safety net for ANY exception after a successful stop (e.g. a stray
@@ -506,5 +570,7 @@ def deploy() -> dict[str, Any]:
             r = start_core()
             _LOGGER.warning(
                 "DEPLOY: finally restart result: ok=%s code=%s error=%s",
-                r["ok"], r["code"], r["error"],
+                r["ok"],
+                r["code"],
+                r["error"],
             )

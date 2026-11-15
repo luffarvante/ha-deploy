@@ -5,10 +5,10 @@ on, and the Supervisor envelope bodies the flow consumes. extra="forbid"
 catches contract drift: a step that grows or renames a result field fails here
 instead of quietly changing what the route answers with.
 """
-import pytest
-from pydantic import BaseModel, ConfigDict, Field
 
 import deploy
+from pydantic import BaseModel, ConfigDict
+import pytest
 
 
 def forbid():
@@ -74,6 +74,7 @@ class GitStatusSummary(BaseModel):
 
 class SupervisorEnvelope(BaseModel):
     """The envelope most Supervisor endpoints answer with (data optional)."""
+
     model_config = ConfigDict(extra="ignore")
     result: str
     data: dict | None = None
@@ -84,6 +85,7 @@ class SupervisorEnvelope(BaseModel):
 
 # --- Supervisor envelope bodies the flow consumes ---------------------------
 
+
 def test_backup_success_body_is_valid_envelope():
     body = {"result": "ok", "data": {"job_id": "e2b7", "slug": "e2b7a9c4"}}
     envelope = SupervisorEnvelope.model_validate(body)
@@ -91,7 +93,11 @@ def test_backup_success_body_is_valid_envelope():
 
 
 def test_backup_error_body_is_valid_envelope():
-    body = {"result": "error", "message": "Backup already running", "error_key": "backup_running"}
+    body = {
+        "result": "error",
+        "message": "Backup already running",
+        "error_key": "backup_running",
+    }
     envelope = SupervisorEnvelope.model_validate(body)
     assert envelope.result == "error"
     assert envelope.message == "Backup already running"
@@ -103,6 +109,7 @@ def test_control_body_is_valid_envelope():
 
 # --- step result contracts (real functions, mocked low level) ---------------
 
+
 def fake_supervisor(code, info):
     return lambda *a, **k: (code, info)
 
@@ -113,12 +120,14 @@ def fake_git(mapping):
             if tuple(args[: len(prefix)]) == prefix:
                 return result
         raise AssertionError(f"unexpected git call: {args}")
+
     return _run_git
 
 
 def test_backup_result_contract_happy(monkeypatch):
     monkeypatch.setattr(
-        deploy, "supervisor_request",
+        deploy,
+        "supervisor_request",
         fake_supervisor(200, {"result": "ok", "data": {"slug": "e2b7a9c4"}}),
     )
     BackupResult.model_validate(deploy.create_backup())
@@ -178,10 +187,16 @@ def test_git_status_summary_contract(monkeypatch):
     monkeypatch.setattr(
         deploy,
         "run_git",
-        fake_git({
-            ("fetch", "origin"): (0, "", ""),
-            ("status", "--porcelain=v1", "-b"): (0, "## main...origin/main\n?? t.txt", ""),
-        }),
+        fake_git(
+            {
+                ("fetch", "origin"): (0, "", ""),
+                ("status", "--porcelain=v1", "-b"): (
+                    0,
+                    "## main...origin/main\n?? t.txt",
+                    "",
+                ),
+            }
+        ),
     )
     summary = deploy.git_status_summary({"GIT_SSH_COMMAND": "x"})
     GitStatusSummary.model_validate(summary)
@@ -191,10 +206,12 @@ def test_gate_check_contract(monkeypatch):
     monkeypatch.setattr(
         deploy,
         "run_git",
-        fake_git({
-            ("fetch", "origin"): (0, "", ""),
-            ("status", "--porcelain=v1", "-b"): (0, "## main...origin/main", ""),
-        }),
+        fake_git(
+            {
+                ("fetch", "origin"): (0, "", ""),
+                ("status", "--porcelain=v1", "-b"): (0, "## main...origin/main", ""),
+            }
+        ),
     )
     ok, reason, st = deploy.gate_check({})
     GateResult.model_validate({"ok": ok, "reason": reason})
@@ -204,4 +221,6 @@ def test_gate_check_contract(monkeypatch):
 def test_contract_drift_is_caught():
     # A result field renamed/added must fail the contract, not drift silently.
     with pytest.raises(ValueError):
-        BackupResult.model_validate({"ok": True, "slug": "x", "code": 200, "error": None, "surprise": 1})
+        BackupResult.model_validate(
+            {"ok": True, "slug": "x", "code": 200, "error": None, "surprise": 1}
+        )

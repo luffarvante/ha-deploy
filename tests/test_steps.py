@@ -1,10 +1,9 @@
 """Tests for the step functions' error->result mapping (each step catches its own)."""
-import pytest
 
 import deploy
 
-
 # --- helpers ----------------------------------------------------------------
+
 
 def fake_supervisor(code, info):
     """Monkeypatch deploy.supervisor_request to return (code, info)."""
@@ -14,10 +13,12 @@ def fake_supervisor(code, info):
 def raising_supervisor(exc):
     def _raise(*a, **k):
         raise exc
+
     return _raise
 
 
 # --- create_backup ----------------------------------------------------------
+
 
 def test_backup_2xx_with_slug(monkeypatch):
     monkeypatch.setattr(
@@ -66,7 +67,9 @@ def test_backup_2xx_body_mismatch_fails(monkeypatch):
 
 
 def test_backup_body_mismatch_no_data_key(monkeypatch):
-    monkeypatch.setattr(deploy, "supervisor_request", fake_supervisor(200, {"weird": 1}))
+    monkeypatch.setattr(
+        deploy, "supervisor_request", fake_supervisor(200, {"weird": 1})
+    )
     b = deploy.create_backup()
     assert b["ok"] is False
 
@@ -90,6 +93,7 @@ def test_backup_unexpected_exception_is_mapped(monkeypatch):
 
 
 # --- stop_core / start_core -------------------------------------------------
+
 
 def test_stop_2xx_ok(monkeypatch):
     monkeypatch.setattr(
@@ -144,13 +148,16 @@ def test_start_exception_mapped(monkeypatch):
 
 # --- pull -------------------------------------------------------------------
 
+
 def fake_git(args_result):
     """Monkeypatch deploy.run_git: map tuple args-prefix -> (rc, out, err)."""
+
     def _run_git(args, env=None):
         for prefix, result in args_result.items():
             if tuple(args[: len(prefix)]) == prefix:
                 return result
         raise AssertionError(f"unexpected git call: {args}")
+
     return _run_git
 
 
@@ -170,7 +177,9 @@ def test_pull_rc_nonzero_fails(monkeypatch):
     monkeypatch.setattr(
         deploy,
         "run_git",
-        fake_git({("pull",): (1, "", "error: Your local changes would be overwritten")}),
+        fake_git(
+            {("pull",): (1, "", "error: Your local changes would be overwritten")}
+        ),
     )
     p = deploy.pull({})
     assert p["ok"] is False
@@ -208,6 +217,7 @@ def test_pull_exception_mapped(monkeypatch):
 
 
 # --- verify -----------------------------------------------------------------
+
 
 def test_verify_only_untracked_ok(monkeypatch):
     monkeypatch.setattr(

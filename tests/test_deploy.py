@@ -3,10 +3,9 @@
 All steps are monkeypatched with recorder fakes; the real git/Supervisor code
 is exercised by the other test files.
 """
-import pytest
 
 import deploy
-
+import pytest
 
 ENV_SENTINEL = {"GIT_SSH_COMMAND": "sentinel"}
 
@@ -90,8 +89,13 @@ def test_happy_path_order_and_single_restart(monkeypatch):
     assert result["backup"] == "abc123"
     assert result["pull_output"] == "updated"
     assert names(calls) == [
-        "gate_check", "create_backup", "stop_core",
-        "gate_check", "pull", "verify", "start_core",
+        "gate_check",
+        "create_backup",
+        "stop_core",
+        "gate_check",
+        "pull",
+        "verify",
+        "start_core",
     ]
     assert names(calls).count("start_core") == 1
 
@@ -123,7 +127,12 @@ def test_gate1_fail_returns_without_any_core_action(monkeypatch):
 def test_backup_fail_returns_without_stopping(monkeypatch):
     calls = install(
         monkeypatch,
-        create_backup={"ok": False, "slug": None, "code": 500, "error": "backup API returned 500"},
+        create_backup={
+            "ok": False,
+            "slug": None,
+            "code": 500,
+            "error": "backup API returned 500",
+        },
     )
     result = deploy.deploy()
     assert result["ok"] is False
@@ -133,7 +142,8 @@ def test_backup_fail_returns_without_stopping(monkeypatch):
 
 def test_stop_fail_returns_without_start(monkeypatch):
     calls = install(
-        monkeypatch, stop_core={"ok": False, "code": 502, "error": "core stop returned 502"}
+        monkeypatch,
+        stop_core={"ok": False, "code": 502, "error": "core stop returned 502"},
     )
     result = deploy.deploy()
     assert result["ok"] is False
@@ -159,7 +169,12 @@ def test_gate2_fail_starts_core_before_returning(monkeypatch):
 def test_pull_fail_starts_core_before_returning(monkeypatch):
     calls = install(
         monkeypatch,
-        pull={"ok": False, "rc": 1, "pull_output": "CONFLICT", "error": "git pull failed"},
+        pull={
+            "ok": False,
+            "rc": 1,
+            "pull_output": "CONFLICT",
+            "error": "git pull failed",
+        },
     )
     result = deploy.deploy()
     assert result["ok"] is False
@@ -171,7 +186,11 @@ def test_pull_fail_starts_core_before_returning(monkeypatch):
 def test_verify_fail_starts_core_before_returning(monkeypatch):
     calls = install(
         monkeypatch,
-        verify={"ok": False, "modified": [" M x"], "error": "unexpected tracked changes"},
+        verify={
+            "ok": False,
+            "modified": [" M x"],
+            "error": "unexpected tracked changes",
+        },
     )
     result = deploy.deploy()
     assert result["ok"] is False

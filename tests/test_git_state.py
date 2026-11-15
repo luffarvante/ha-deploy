@@ -1,5 +1,4 @@
 """Tests for git state classification (Git states section of the plan)."""
-import pytest
 
 import deploy
 
@@ -27,7 +26,6 @@ def test_both_git_calls_receive_env(monkeypatch):
     _, calls = summarize(monkeypatch)
     assert calls == [["fetch", "origin"], ["status", "--porcelain=v1", "-b"]]
     # env assertion done via run_git kwarg capture below
-    run_git, _ = make_run_git()
 
     captured_envs = []
 
@@ -49,9 +47,7 @@ def test_clean(monkeypatch):
 
 
 def test_behind_origin_passes_gate(monkeypatch):
-    st, _ = summarize(
-        monkeypatch, status_out="## main...origin/main [behind 2]"
-    )
+    st, _ = summarize(monkeypatch, status_out="## main...origin/main [behind 2]")
     assert st["summary"] == "behind origin"
     assert st["behind"] == 2
     assert st["gate_ok"] is True
@@ -102,7 +98,9 @@ def test_contains_updates_fails_gate(monkeypatch):
 
 def test_fetch_auth_error(monkeypatch):
     st, _ = summarize(
-        monkeypatch, fetch_rc=128, fetch_err="git@github.com: Permission denied (publickey)."
+        monkeypatch,
+        fetch_rc=128,
+        fetch_err="git@github.com: Permission denied (publickey).",
     )
     assert st["fetch_ok"] is False
     assert st["summary"] == "auth error"
@@ -127,7 +125,7 @@ def test_status_failure_fails_gate(monkeypatch):
 def test_gate_check_clean(monkeypatch):
     run_git, _ = make_run_git(status_out="## main...origin/main")
     monkeypatch.setattr(deploy, "run_git", run_git)
-    ok, reason, st = deploy.gate_check({})
+    ok, reason, _st = deploy.gate_check({})
     assert ok is True
     assert reason == "clean"
 
@@ -135,7 +133,7 @@ def test_gate_check_clean(monkeypatch):
 def test_gate_check_ahead_reason(monkeypatch):
     run_git, _ = make_run_git(status_out="## main...origin/main [ahead 1]")
     monkeypatch.setattr(deploy, "run_git", run_git)
-    ok, reason, st = deploy.gate_check({})
+    ok, reason, _st = deploy.gate_check({})
     assert ok is False
     assert "ahead" in reason
 
@@ -143,7 +141,7 @@ def test_gate_check_ahead_reason(monkeypatch):
 def test_gate_check_modified_tracked_reason(monkeypatch):
     run_git, _ = make_run_git(status_out=" M tracked.txt")
     monkeypatch.setattr(deploy, "run_git", run_git)
-    ok, reason, st = deploy.gate_check({})
+    ok, reason, _st = deploy.gate_check({})
     assert ok is False
     assert "modified tracked" in reason
 
@@ -151,7 +149,7 @@ def test_gate_check_modified_tracked_reason(monkeypatch):
 def test_gate_check_status_failed_reason(monkeypatch):
     run_git, _ = make_run_git(status_rc=1, status_out="")
     monkeypatch.setattr(deploy, "run_git", run_git)
-    ok, reason, st = deploy.gate_check({})
+    ok, reason, _st = deploy.gate_check({})
     assert ok is False
     assert "status failed" in reason
 
@@ -159,6 +157,6 @@ def test_gate_check_status_failed_reason(monkeypatch):
 def test_gate_check_fetch_failed_reason(monkeypatch):
     run_git, _ = make_run_git(fetch_rc=128, fetch_err="nope")
     monkeypatch.setattr(deploy, "run_git", run_git)
-    ok, reason, st = deploy.gate_check({})
+    ok, reason, _st = deploy.gate_check({})
     assert ok is False
     assert reason.startswith("fetch failed")
