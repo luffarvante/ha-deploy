@@ -1,5 +1,6 @@
 """Mapping tests for supervisor_request (defensive wrapper, never raises)."""
 
+import email.message
 import io
 import json
 import urllib.error
@@ -24,7 +25,11 @@ class FakeResponse:
 
 def http_error(code, body):
     return urllib.error.HTTPError(
-        "http://supervisor/test", code, "boom", None, io.BytesIO(body.encode())
+        "http://supervisor/test",
+        code,
+        "boom",
+        email.message.Message(),
+        io.BytesIO(body.encode()),
     )
 
 
@@ -85,7 +90,9 @@ def test_non_2xx_with_unreadable_body_maps_to_error_value(monkeypatch):
     def raise_on_read():
         raise OSError("no body")
 
-    err = urllib.error.HTTPError("http://supervisor/test", 503, "boom", None, None)
+    err = urllib.error.HTTPError(
+        "http://supervisor/test", 503, "boom", email.message.Message(), None
+    )
     monkeypatch.setattr(err, "read", raise_on_read)
     monkeypatch.setattr(
         deploy.urllib.request,

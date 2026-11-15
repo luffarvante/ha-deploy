@@ -77,7 +77,7 @@ class SupervisorEnvelope(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
     result: str
-    data: dict | None = None
+    data: dict[str, object] | None = None
     message: str | None = None
     error_key: str | None = None
     job_id: str | None = None
@@ -89,6 +89,7 @@ class SupervisorEnvelope(BaseModel):
 def test_backup_success_body_is_valid_envelope():
     body = {"result": "ok", "data": {"job_id": "e2b7", "slug": "e2b7a9c4"}}
     envelope = SupervisorEnvelope.model_validate(body)
+    assert envelope.data is not None
     assert envelope.data["slug"] == "e2b7a9c4"
 
 

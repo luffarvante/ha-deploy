@@ -52,7 +52,7 @@ def test_backup_non_2xx_fails(monkeypatch):
     )
     b = deploy.create_backup()
     assert b["ok"] is False
-    assert "500" in b["error"]
+    assert b["error"] is not None and "500" in b["error"]
     assert b["slug"] is None
 
 
@@ -63,7 +63,7 @@ def test_backup_2xx_body_mismatch_fails(monkeypatch):
     )
     b = deploy.create_backup()
     assert b["ok"] is False
-    assert "unexpected body" in b["error"]
+    assert b["error"] is not None and "unexpected body" in b["error"]
 
 
 def test_backup_body_mismatch_no_data_key(monkeypatch):
@@ -80,7 +80,7 @@ def test_backup_network_error_fails(monkeypatch):
     )
     b = deploy.create_backup()
     assert b["ok"] is False
-    assert "-1" in b["error"]
+    assert b["error"] is not None and "-1" in b["error"]
 
 
 def test_backup_unexpected_exception_is_mapped(monkeypatch):
@@ -89,7 +89,7 @@ def test_backup_unexpected_exception_is_mapped(monkeypatch):
     )
     b = deploy.create_backup()
     assert b["ok"] is False
-    assert "boom" in b["error"]
+    assert b["error"] is not None and "boom" in b["error"]
 
 
 def test_backup_non_dict_json_body_fails(monkeypatch):
@@ -98,7 +98,7 @@ def test_backup_non_dict_json_body_fails(monkeypatch):
     monkeypatch.setattr(deploy, "supervisor_request", fake_supervisor(200, []))
     b = deploy.create_backup()
     assert b["ok"] is False
-    assert "unexpected body" in b["error"]
+    assert b["error"] is not None and "unexpected body" in b["error"]
 
 
 # --- stop_core / start_core -------------------------------------------------
@@ -119,7 +119,7 @@ def test_stop_non_2xx_fails(monkeypatch):
     )
     s = deploy.stop_core()
     assert s["ok"] is False
-    assert "502" in s["error"]
+    assert s["error"] is not None and "502" in s["error"]
 
 
 def test_stop_exception_mapped(monkeypatch):
@@ -144,7 +144,7 @@ def test_start_non_2xx_fails(monkeypatch):
     )
     s = deploy.start_core()
     assert s["ok"] is False
-    assert "500" in s["error"]
+    assert s["error"] is not None and "500" in s["error"]
 
 
 def test_start_exception_mapped(monkeypatch):
@@ -236,7 +236,7 @@ def test_pull_exception_mapped(monkeypatch):
     monkeypatch.setattr(deploy, "run_git", _raise)
     p = deploy.pull({})
     assert p["ok"] is False
-    assert "pull exploded" in p["error"]
+    assert p["error"] is not None and "pull exploded" in p["error"]
 
 
 # --- verify -----------------------------------------------------------------
@@ -282,7 +282,7 @@ def test_verify_status_rc_nonzero_fails(monkeypatch):
     )
     v = deploy.verify({})
     assert v["ok"] is False
-    assert "fatal" in v["error"]
+    assert v["error"] is not None and "fatal" in v["error"]
 
 
 def test_verify_exception_mapped(monkeypatch):
@@ -292,4 +292,4 @@ def test_verify_exception_mapped(monkeypatch):
     monkeypatch.setattr(deploy, "run_git", _raise)
     v = deploy.verify({})
     assert v["ok"] is False
-    assert "v" in v["error"]
+    assert v["error"] is not None and "v" in v["error"]

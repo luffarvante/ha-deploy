@@ -1,9 +1,15 @@
-[tool.mypy]
-# Target the Python in the app's base image (ghcr.io/hassio-addons/base 21.x
-# = Alpine 3.22 = Python 3.12). Dev-only tool; nothing here ships.
-python_version = "3.12"
-strict = true
-files = ["ha_deploy/rootfs/app/deploy.py"]
+[tool.basedpyright]
+# The app's base image (ghcr.io/hassio-addons/base 21.x = Alpine 3.22) is
+# Python 3.12. Dev-only tool; nothing here ships. Scope grows with the typing
+# migration: server.py joins when the dead old code is deleted.
+typeCheckingMode = "recommended"
+reportMatchNotExhaustive = "error"
+pythonVersion = "3.12"
+include = ["ha_deploy/rootfs/app/deploy.py", "tests"]
+venvPath = "."
+venv = ".venv"
+# tests reach the app modules via the conftest sys.path hook.
+extraPaths = ["ha_deploy/rootfs/app"]
 
 # --- ruff -------------------------------------------------------------------
 # Home Assistant Core's ruff config (Apache-2.0, pyproject.toml in
