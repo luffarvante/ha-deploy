@@ -1,10 +1,9 @@
-"""Route tests for server.py's live parts (decided, T).
+"""Route tests for server.py (decided, T).
 
 Real ThreadingHTTPServer on an ephemeral localhost port; requests go through
 urllib so status codes, headers, and JSON encoding are exercised as served.
-The old v2b code inside server.py is deliberately left untested (removed at
-the deferred cleanup). /status still calls the legacy git copy; this test is
-re-pointed when the route switches to deploy.py.
+/status serves the typed StatusView; /deploy serves DeployOutcome (or
+RouteCrash from the last-resort catch) as model_dump_json.
 """
 
 from http.server import ThreadingHTTPServer
@@ -106,21 +105,24 @@ def test_create_writes_test_file(api, monkeypatch, tmp_path):
     assert test_file.read_text() == "OHAI\n"
 
 
-# --- /status (legacy copy; re-point when the route switches to deploy.py) ----
+# --- /status (typed StatusView) ----------------------------------------------
 
 
-def test_status_uses_legacy_copy(api, monkeypatch):
-    def fake_run_git(args, env=None):
+def test_status_serves_typed_view(api, monkeypatch):
+    def fake_run_git(args, env):
         if args[:2] == ["fetch", "origin"]:
-            return 0, "", ""
-        return 0, "## main...origin/main\n?? t.txt", ""
+            return deploy.RunGitSuccess(stdout="", stderr="")
+        return deploy.RunGitSuccess(stdout="## main...origin/main\n?? t.txt", stderr="")
 
-    monkeypatch.setattr(server, "run_git", fake_run_git)
+    monkeypatch.setattr(deploy, "run_git", fake_run_git)
     status, body = json_request(api, "/status")
     assert status == 200
-    assert body["summary"] == "untracked only"
-    assert body["gate_ok"] is True
-    assert "status_ok" not in body  # legacy copy contract, see comment above
+    assert body["report"]["branch"] == "main...origin/main"
+    assert body["report"]["state"] == {
+        "kind": "untracked-only",
+        "changes": [{"status": "??", "path": "t.txt"}],
+    }
+    assert body["gate"] == {"kind": "gate-pass"}
 
 
 # --- /deploy wiring + last-resort catch -------------------------------------
@@ -131,27 +133,29 @@ def test_deploy_route_success(api, monkeypatch):
 
     def fake_deploy():
         calls.append(1)
-        return {"ok": True, "pull_output": "updated", "backup": "s", "started": True}
+        return deploy.DeploySucceeded(output="updated", backup="s")
 
     monkeypatch.setattr(deploy, "deploy", fake_deploy)
     status, body = json_request(api, "/deploy", method="POST")
     assert calls == [1]
     assert status == 200
-    assert body == {
-        "ok": True,
-        "pull_output": "updated",
-        "backup": "s",
-        "started": True,
-    }
+    assert body == {"kind": "deploy-succeeded", "output": "updated", "backup": "s"}
 
 
 def test_deploy_route_failure_is_500_json(api, monkeypatch):
     monkeypatch.setattr(
-        deploy, "deploy", lambda: {"ok": False, "error": "gate failed: x"}
+        deploy,
+        "deploy",
+        lambda: deploy.BlockedByBackup(
+            reason="backup API returned 500: {'result': 'error'}"
+        ),
     )
     status, body = json_request(api, "/deploy", method="POST")
     assert status == 500
-    assert body == {"ok": False, "error": "gate failed: x"}
+    assert body == {
+        "kind": "blocked-by-backup",
+        "reason": "backup API returned 500: {'result': 'error'}",
+    }
 
 
 def test_deploy_route_last_resort_catch_guarantees_json(api, monkeypatch):
@@ -161,5 +165,5 @@ def test_deploy_route_last_resort_catch_guarantees_json(api, monkeypatch):
     monkeypatch.setattr(deploy, "deploy", boom)
     status, body = json_request(api, "/deploy", method="POST")
     assert status == 500
-    assert body["ok"] is False
-    assert "RuntimeError('boom')" in body["error"]
+    assert body["kind"] == "route-crash"
+    assert "RuntimeError('boom')" in body["reason"]

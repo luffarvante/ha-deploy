@@ -5,7 +5,7 @@
 typeCheckingMode = "recommended"
 reportMatchNotExhaustive = "error"
 pythonVersion = "3.12"
-include = ["ha_deploy/rootfs/app/deploy.py", "tests"]
+include = ["ha_deploy/rootfs/app/deploy.py", "ha_deploy/rootfs/app/server.py", "tests"]
 venvPath = "."
 venv = ".venv"
 # tests reach the app modules via the conftest sys.path hook.
@@ -22,6 +22,9 @@ target-version = "py312"
 extend-exclude = [".venv", "adrian_tmp.py"]  # temporary scratch file, slated for removal
 
 [tool.ruff.lint]
+# UP035 (assert_never should come from typing) is added to the ignore list
+# below: typing.assert_never needs Python 3.11+ and the dev venv runs 3.10;
+# typing_extensions is the backport. The app image itself is 3.12.
 select = [
   "A001",   # Variable {name} is shadowing a Python builtin
   "ASYNC",  # flake8-async
@@ -102,6 +105,7 @@ ignore = [
   "D407",     # Section name underlining
   "D417",     # Missing argument descriptions in docstring
   "E501",     # line too long
+  "UP035",    # assert_never stays on typing_extensions (dev venv is 3.10)
 
   "PLC1901", # {existing} can be simplified; too many false positives
   "PLR0911", # Too many return statements (deploy() is a straight-line flow)

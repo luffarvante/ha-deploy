@@ -1,172 +1,297 @@
-"""Tests for git state classification (Git states section of the plan)."""
+"""Tests for git_status_summary / gate / status_view: states are the variants."""
 
 import deploy
 
+ENV = {"GIT_SSH_COMMAND": "sentinel"}
 
-def make_run_git(fetch_rc=0, fetch_err="", status_rc=0, status_out=""):
+
+def make_run_git(fetch_outcome, status_outcome):
     calls = []
 
-    def _run_git(args, env=None):
-        calls.append(list(args))
+    def _run_git(args, env):
+        calls.append((list(args), env))
         if args[:2] == ["fetch", "origin"]:
-            return fetch_rc, "", fetch_err
-        return status_rc, status_out, ""
+            return fetch_outcome
+        return status_outcome
 
     return _run_git, calls
 
 
-def summarize(monkeypatch, fetch_rc=0, fetch_err="", status_rc=0, status_out=""):
-    run_git, calls = make_run_git(fetch_rc, fetch_err, status_rc, status_out)
+def summarize(monkeypatch, fetch_outcome=None, status_outcome=None):
+    fetch = (
+        fetch_outcome
+        if fetch_outcome is not None
+        else deploy.RunGitSuccess(stdout="", stderr="")
+    )
+    status = (
+        status_outcome
+        if status_outcome is not None
+        else deploy.RunGitSuccess(stdout="", stderr="")
+    )
+    run_git, calls = make_run_git(fetch, status)
     monkeypatch.setattr(deploy, "run_git", run_git)
-    st = deploy.git_status_summary({"GIT_SSH_COMMAND": "x"})
-    return st, calls
+    report = deploy.git_status_summary(ENV)
+    return report, calls
 
 
-def test_both_git_calls_receive_env(monkeypatch):
-    _, calls = summarize(monkeypatch)
-    assert calls == [["fetch", "origin"], ["status", "--porcelain=v1", "-b"]]
-    # env assertion done via run_git kwarg capture below
-
-    captured_envs = []
-
-    def _run_git(args, env=None):
-        captured_envs.append(env)
-        if args[:2] == ["fetch", "origin"]:
-            return 0, "", ""
-        return 0, "", ""
-
-    monkeypatch.setattr(deploy, "run_git", _run_git)
-    deploy.git_status_summary({"GIT_SSH_COMMAND": "sentinel"})
-    assert all(env == {"GIT_SSH_COMMAND": "sentinel"} for env in captured_envs)
+# --- classification ----------------------------------------------------------
 
 
 def test_clean(monkeypatch):
-    st, _ = summarize(monkeypatch, status_out="## main...origin/main")
-    assert st["summary"] == "clean"
-    assert st["gate_ok"] is True
-
-
-def test_behind_origin_passes_gate(monkeypatch):
-    st, _ = summarize(monkeypatch, status_out="## main...origin/main [behind 2]")
-    assert st["summary"] == "behind origin"
-    assert st["behind"] == 2
-    assert st["gate_ok"] is True
-
-
-def test_ahead_of_origin_fails_gate(monkeypatch):
-    st, _ = summarize(monkeypatch, status_out="## main...origin/main [ahead 3]")
-    assert st["summary"] == "ahead of origin"
-    assert st["ahead"] == 3
-    assert st["gate_ok"] is False
-
-
-def test_diverged_fails_gate(monkeypatch):
-    st, _ = summarize(
-        monkeypatch, status_out="## main...origin/main [behind 1, ahead 1]"
-    )
-    assert st["summary"] == "diverged"
-    assert st["gate_ok"] is False
-
-
-def test_untracked_only_passes_gate(monkeypatch):
-    st, _ = summarize(
+    report, calls = summarize(
         monkeypatch,
-        status_out="## main...origin/main\n?? ha-deploy-test.txt\n?? tmp/",
+        status_outcome=deploy.RunGitSuccess(stdout="## main...origin/main", stderr=""),
     )
-    assert st["summary"] == "untracked only"
-    assert st["gate_ok"] is True
-    assert len(st["changes"]) == 2
+    assert report.branch == "main...origin/main"
+    assert report.state == deploy.Clean()
+    assert calls == [
+        (["fetch", "origin"], ENV),
+        (["status", "--porcelain=v1", "-b"], ENV),
+    ]
 
 
-def test_only_additions_fails_gate(monkeypatch):
-    st, _ = summarize(monkeypatch, status_out="A  newfile.txt")
-    assert st["summary"] == "only additions"
-    assert st["gate_ok"] is False
+def test_behind_origin(monkeypatch):
+    report, _ = summarize(
+        monkeypatch,
+        status_outcome=deploy.RunGitSuccess(
+            stdout="## main...origin/main [behind 2]", stderr=""
+        ),
+    )
+    assert report.state == deploy.BehindOrigin(behind=2)
 
 
-def test_only_deletions_fails_gate(monkeypatch):
-    st, _ = summarize(monkeypatch, status_out="D  oldfile.txt")
-    assert st["summary"] == "only deletions"
-    assert st["gate_ok"] is False
+def test_ahead_of_origin(monkeypatch):
+    report, _ = summarize(
+        monkeypatch,
+        status_outcome=deploy.RunGitSuccess(
+            stdout="## main...origin/main [ahead 3]", stderr=""
+        ),
+    )
+    assert report.state == deploy.AheadOfOrigin(ahead=3)
 
 
-def test_contains_updates_fails_gate(monkeypatch):
-    st, _ = summarize(monkeypatch, status_out=" M tracked.txt\n?? other.txt")
-    assert st["summary"] == "contains updates"
-    assert st["gate_ok"] is False
+def test_diverged(monkeypatch):
+    report, _ = summarize(
+        monkeypatch,
+        status_outcome=deploy.RunGitSuccess(
+            stdout="## main...origin/main [ahead 1, behind 2]", stderr=""
+        ),
+    )
+    assert report.state == deploy.Diverged(ahead=1, behind=2)
+
+
+def test_untracked_only_keeps_changes(monkeypatch):
+    report, _ = summarize(
+        monkeypatch,
+        status_outcome=deploy.RunGitSuccess(
+            stdout="## main...origin/main\n?? new.txt\n?? dir/other.txt", stderr=""
+        ),
+    )
+    assert report.state == deploy.UntrackedOnly(
+        changes=[
+            deploy.Change(status="??", path="new.txt"),
+            deploy.Change(status="??", path="dir/other.txt"),
+        ]
+    )
+
+
+def test_only_additions(monkeypatch):
+    report, _ = summarize(
+        monkeypatch,
+        status_outcome=deploy.RunGitSuccess(
+            stdout="## main...origin/main\nA  added.txt\nAM mixed.txt", stderr=""
+        ),
+    )
+    assert report.state == deploy.OnlyAdditions(
+        changes=[
+            deploy.Change(status="A", path="added.txt"),
+            deploy.Change(status="AM", path="mixed.txt"),
+        ]
+    )
+
+
+def test_only_deletions(monkeypatch):
+    report, _ = summarize(
+        monkeypatch,
+        status_outcome=deploy.RunGitSuccess(
+            stdout="## main...origin/main\nD  gone.txt\nAD staged-deleted", stderr=""
+        ),
+    )
+    assert report.state == deploy.OnlyDeletions(
+        changes=[
+            deploy.Change(status="D", path="gone.txt"),
+            deploy.Change(status="AD", path="staged-deleted"),
+        ]
+    )
+
+
+def test_contains_updates(monkeypatch):
+    report, _ = summarize(
+        monkeypatch,
+        status_outcome=deploy.RunGitSuccess(
+            stdout="## main...origin/main\n M mod.txt\n?? new", stderr=""
+        ),
+    )
+    assert report.state == deploy.ContainsUpdates(
+        changes=[
+            deploy.Change(status="M", path="mod.txt"),
+            deploy.Change(status="??", path="new"),
+        ]
+    )
+
+
+def test_fetch_failure(monkeypatch):
+    report, _ = summarize(
+        monkeypatch,
+        fetch_outcome=deploy.RunGitFailure(stdout="", stderr="connection timed out"),
+    )
+    assert report.branch is None
+    assert report.state == deploy.FetchFailed(reason="connection timed out")
 
 
 def test_fetch_auth_error(monkeypatch):
-    st, _ = summarize(
+    report, _ = summarize(
         monkeypatch,
-        fetch_rc=128,
-        fetch_err="git@github.com: Permission denied (publickey).",
+        fetch_outcome=deploy.RunGitFailure(
+            stdout="", stderr="Permission denied (publickey)"
+        ),
     )
-    assert st["fetch_ok"] is False
-    assert st["summary"] == "auth error"
-    assert st["gate_ok"] is False
+    assert report.state == deploy.AuthError(reason="Permission denied (publickey)")
 
 
-def test_fetch_generic_error(monkeypatch):
-    st, _ = summarize(
-        monkeypatch, fetch_rc=128, fetch_err="fatal: Could not resolve host: example"
+def test_fetch_exception_classified_like_failure_text(monkeypatch):
+    report, _ = summarize(
+        monkeypatch, fetch_outcome=deploy.RunGitException(reason="git gone")
     )
-    assert st["summary"] == "fetch failed"
-    assert st["gate_ok"] is False
+    assert report.branch is None
+    assert report.state == deploy.FetchFailed(reason="git gone")
 
 
-def test_status_failure_fails_gate(monkeypatch):
-    st, _ = summarize(monkeypatch, status_rc=1, status_out="")
-    assert st["status_ok"] is False
-    assert st["summary"] == "status failed"
-    assert st["gate_ok"] is False
+def test_status_failure(monkeypatch):
+    report, _ = summarize(
+        monkeypatch,
+        status_outcome=deploy.RunGitFailure(
+            stdout="", stderr="fatal: not a git repository"
+        ),
+    )
+    assert report.branch is None
+    assert report.state == deploy.StatusFailed(reason="fatal: not a git repository")
 
 
+def test_status_exception(monkeypatch):
+    report, _ = summarize(
+        monkeypatch,
+        status_outcome=deploy.RunGitException(reason="git status exploded"),
+    )
+    assert report.state == deploy.StatusFailed(reason="git status exploded")
+
+
+# pinned: upstream-gone line currently classifies as clean with no ahead/behind
 def test_upstream_gone_currently_classified_clean(monkeypatch):
-    # Known gap: '[gone]' has no ahead/behind match and no changes, so the
-    # classifier calls it clean and the gate passes; the pull then fails
-    # downstream. Pinned so a future classification fix flips this test
-    # deliberately rather than silently.
-    st, _ = summarize(monkeypatch, status_out="## main...origin/main [gone]")
-    assert st["summary"] == "clean"
-    assert st["gate_ok"] is True
+    report, _ = summarize(
+        monkeypatch,
+        status_outcome=deploy.RunGitSuccess(
+            stdout="## main...origin/main [gone]", stderr=""
+        ),
+    )
+    assert report.branch == "main...origin/main [gone]"
+    assert report.state == deploy.Clean()
 
 
-def test_gate_check_clean(monkeypatch):
-    run_git, _ = make_run_git(status_out="## main...origin/main")
+# --- gate --------------------------------------------------------------------
+
+
+def test_gate_passes_on_clean(monkeypatch):
+    report, _ = summarize(
+        monkeypatch,
+        status_outcome=deploy.RunGitSuccess(stdout="## main...origin/main", stderr=""),
+    )
+    verdict = deploy.gate_verdict(report.state)
+    assert verdict == deploy.GatePass()
+
+
+def test_gate_passes_on_untracked_only(monkeypatch):
+    verdict = deploy.gate_verdict(
+        deploy.UntrackedOnly(changes=[deploy.Change(status="??", path="x")])
+    )
+    assert verdict == deploy.GatePass()
+
+
+def test_gate_passes_on_behind_origin(monkeypatch):
+    verdict = deploy.gate_verdict(deploy.BehindOrigin(behind=2))
+    assert verdict == deploy.GatePass()
+
+
+def test_gate_blocks_ahead_with_reason(monkeypatch):
+    verdict = deploy.gate_verdict(deploy.AheadOfOrigin(ahead=1))
+    assert isinstance(verdict, deploy.GateBlocked)
+    assert "unpushed" in verdict.reason
+
+
+def test_gate_blocks_diverged_with_ahead_reason(monkeypatch):
+    verdict = deploy.gate_verdict(deploy.Diverged(ahead=1, behind=1))
+    assert isinstance(verdict, deploy.GateBlocked)
+    assert "unpushed" in verdict.reason
+
+
+def test_gate_blocks_modified_tracked_files(monkeypatch):
+    verdict = deploy.gate_verdict(
+        deploy.ContainsUpdates(changes=[deploy.Change(status="M", path="mod.txt")])
+    )
+    assert isinstance(verdict, deploy.GateBlocked)
+    assert verdict.reason == "modified tracked files present - resolve manually first"
+
+
+def test_gate_blocks_only_additions(monkeypatch):
+    verdict = deploy.gate_verdict(
+        deploy.OnlyAdditions(changes=[deploy.Change(status="A", path="added.txt")])
+    )
+    assert isinstance(verdict, deploy.GateBlocked)
+    assert "modified tracked files" in verdict.reason
+
+
+def test_gate_blocks_fetch_failure(monkeypatch):
+    verdict = deploy.gate_verdict(deploy.FetchFailed(reason="no route to host"))
+    assert isinstance(verdict, deploy.GateBlocked)
+    assert verdict.reason == "fetch failed: no route to host"
+
+
+def test_gate_blocks_auth_error(monkeypatch):
+    verdict = deploy.gate_verdict(
+        deploy.AuthError(reason="Permission denied (publickey)")
+    )
+    assert isinstance(verdict, deploy.GateBlocked)
+    assert verdict.reason == "fetch failed: Permission denied (publickey)"
+
+
+def test_gate_blocks_status_failure(monkeypatch):
+    verdict = deploy.gate_verdict(
+        deploy.StatusFailed(reason="fatal: not a git repository")
+    )
+    assert isinstance(verdict, deploy.GateBlocked)
+    assert verdict.reason == "status failed: fatal: not a git repository"
+
+
+# --- status view -------------------------------------------------------------
+
+
+def test_status_view_carries_report_and_gate(monkeypatch):
+    report, _ = summarize(
+        monkeypatch,
+        status_outcome=deploy.RunGitSuccess(stdout="## main...origin/main", stderr=""),
+    )
+    view = deploy.status_view(ENV)
+    assert view.report == report
+    assert view.gate == deploy.GatePass()
+
+
+def test_status_view_gate_blocked_keeps_state(monkeypatch):
+    run_git, _ = make_run_git(
+        deploy.RunGitSuccess(stdout="", stderr=""),
+        deploy.RunGitFailure(stdout="", stderr="fatal: bad object"),
+    )
     monkeypatch.setattr(deploy, "run_git", run_git)
-    ok, reason, _st = deploy.gate_check({})
-    assert ok is True
-    assert reason == "clean"
-
-
-def test_gate_check_ahead_reason(monkeypatch):
-    run_git, _ = make_run_git(status_out="## main...origin/main [ahead 1]")
-    monkeypatch.setattr(deploy, "run_git", run_git)
-    ok, reason, _st = deploy.gate_check({})
-    assert ok is False
-    assert "ahead" in reason
-
-
-def test_gate_check_modified_tracked_reason(monkeypatch):
-    run_git, _ = make_run_git(status_out=" M tracked.txt")
-    monkeypatch.setattr(deploy, "run_git", run_git)
-    ok, reason, _st = deploy.gate_check({})
-    assert ok is False
-    assert "modified tracked" in reason
-
-
-def test_gate_check_status_failed_reason(monkeypatch):
-    run_git, _ = make_run_git(status_rc=1, status_out="")
-    monkeypatch.setattr(deploy, "run_git", run_git)
-    ok, reason, _st = deploy.gate_check({})
-    assert ok is False
-    assert "status failed" in reason
-
-
-def test_gate_check_fetch_failed_reason(monkeypatch):
-    run_git, _ = make_run_git(fetch_rc=128, fetch_err="nope")
-    monkeypatch.setattr(deploy, "run_git", run_git)
-    ok, reason, _st = deploy.gate_check({})
-    assert ok is False
-    assert reason.startswith("fetch failed")
+    view = deploy.status_view(ENV)
+    assert view.report.state == deploy.StatusFailed(reason="fatal: bad object")
+    assert isinstance(view.gate, deploy.GateBlocked)
+    assert "status failed" in view.gate.reason

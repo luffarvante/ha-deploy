@@ -1,4 +1,4 @@
-"""Mapping tests for supervisor_request (defensive wrapper, never raises)."""
+"""Tests for supervisor_request: HTTP/network outcomes as sum types."""
 
 import email.message
 import io
@@ -41,12 +41,36 @@ def test_2xx_json_is_parsed(monkeypatch):
     monkeypatch.setattr(
         deploy.urllib.request, "urlopen", lambda req, timeout=None: ok_200()
     )
-    code, info = deploy.supervisor_request("GET", "/test")
-    assert code == 200
-    assert info == {"result": "ok", "data": {}}
+    outcome = deploy.supervisor_request("GET", "/test", None, 30)
+    assert isinstance(outcome, deploy.SupervisorOk)
+    assert outcome.code == 200
+    assert outcome.body == {"result": "ok", "data": {}}
 
 
-def test_post_data_is_sent_as_json(monkeypatch):
+def test_2xx_non_json_body_is_body_mismatch(monkeypatch):
+    monkeypatch.setattr(
+        deploy.urllib.request,
+        "urlopen",
+        lambda req, timeout=None: FakeResponse(200, "not json"),
+    )
+    outcome = deploy.supervisor_request("GET", "/test", None, 30)
+    assert isinstance(outcome, deploy.SupervisorBodyMismatch)
+    assert outcome.code == 200
+    assert outcome.raw == "not json"
+
+
+def test_2xx_array_body_passes_through_untouched(monkeypatch):
+    monkeypatch.setattr(
+        deploy.urllib.request,
+        "urlopen",
+        lambda req, timeout=None: FakeResponse(200, "[]"),
+    )
+    outcome = deploy.supervisor_request("GET", "/test", None, 30)
+    assert isinstance(outcome, deploy.SupervisorOk)
+    assert outcome.body == []
+
+
+def test_post_body_is_sent_as_json(monkeypatch):
     captured = {}
 
     def fake_urlopen(req, timeout=None):
@@ -55,95 +79,27 @@ def test_post_data_is_sent_as_json(monkeypatch):
         return ok_200()
 
     monkeypatch.setattr(deploy.urllib.request, "urlopen", fake_urlopen)
-    code, _info = deploy.supervisor_request("POST", "/test", {"name": "x"})
-    assert code == 200
+    outcome = deploy.supervisor_request("POST", "/test", {"name": "x"}, 30)
+    assert isinstance(outcome, deploy.SupervisorOk)
     assert json.loads(captured["data"]) == {"name": "x"}
     assert captured["content_type"] == "application/json"
 
 
-def test_non_2xx_with_json_body_is_parsed(monkeypatch):
-    monkeypatch.setattr(
-        deploy.urllib.request,
-        "urlopen",
-        lambda req, timeout=None: (_ for _ in ()).throw(
-            http_error(502, json.dumps({"result": "error", "message": "down"}))
-        ),
-    )
-    code, info = deploy.supervisor_request("GET", "/test")
-    assert code == 502
-    assert info == {"result": "error", "message": "down"}
+def test_no_body_sends_no_data_and_no_content_type(monkeypatch):
+    captured = {}
+
+    def fake_urlopen(req, timeout=None):
+        captured["data"] = req.data
+        captured["content_type"] = req.headers.get("Content-type")
+        return ok_200()
+
+    monkeypatch.setattr(deploy.urllib.request, "urlopen", fake_urlopen)
+    deploy.supervisor_request("POST", "/test", None, 30)
+    assert captured["data"] is None
+    assert captured["content_type"] is None
 
 
-def test_non_2xx_with_non_json_body_maps_to_error_value(monkeypatch):
-    monkeypatch.setattr(
-        deploy.urllib.request,
-        "urlopen",
-        lambda req, timeout=None: (_ for _ in ()).throw(http_error(500, "oops")),
-    )
-    code, info = deploy.supervisor_request("GET", "/test")
-    assert code == 500
-    assert info["error"] == "non-JSON error body"
-    assert info["raw"] == "oops"
-
-
-def test_non_2xx_with_unreadable_body_maps_to_error_value(monkeypatch):
-    def raise_on_read():
-        raise OSError("no body")
-
-    err = urllib.error.HTTPError(
-        "http://supervisor/test", 503, "boom", email.message.Message(), None
-    )
-    monkeypatch.setattr(err, "read", raise_on_read)
-    monkeypatch.setattr(
-        deploy.urllib.request,
-        "urlopen",
-        lambda req, timeout=None: (_ for _ in ()).throw(err),
-    )
-    code, info = deploy.supervisor_request("GET", "/test")
-    assert code == 503
-    assert info["error"] == "non-JSON error body"
-
-
-def test_network_error_maps_to_code_minus_one(monkeypatch):
-    monkeypatch.setattr(
-        deploy.urllib.request,
-        "urlopen",
-        lambda req, timeout=None: (_ for _ in ()).throw(
-            urllib.error.URLError("connection refused")
-        ),
-    )
-    code, info = deploy.supervisor_request("GET", "/test")
-    assert code == -1
-    assert "connection refused" in info["error"]
-
-
-def test_2xx_with_non_json_body_maps_to_body_mismatch_value(monkeypatch):
-    monkeypatch.setattr(
-        deploy.urllib.request,
-        "urlopen",
-        lambda req, timeout=None: FakeResponse(200, "<html>not json</html>"),
-    )
-    code, info = deploy.supervisor_request("GET", "/test")
-    assert code == 200
-    assert info["error"] == "non-JSON response body"
-    assert info["raw"] == "<html>not json</html>"
-
-
-def test_valid_json_non_dict_body_passes_through(monkeypatch):
-    # json.loads succeeds on "[]" / "null" even though the contract says dict;
-    # the pass-through is pinned here, and the steps' isinstance guards are
-    # what keep it safe (see test_steps.test_backup_non_dict_json_body_fails).
-    monkeypatch.setattr(
-        deploy.urllib.request,
-        "urlopen",
-        lambda req, timeout=None: FakeResponse(200, "[]"),
-    )
-    code, info = deploy.supervisor_request("GET", "/test")
-    assert code == 200
-    assert info == []
-
-
-def test_bearer_token_header_is_set(monkeypatch):
+def test_bearer_header_is_sent(monkeypatch):
     captured = {}
 
     def fake_urlopen(req, timeout=None):
@@ -151,5 +107,56 @@ def test_bearer_token_header_is_set(monkeypatch):
         return ok_200()
 
     monkeypatch.setattr(deploy.urllib.request, "urlopen", fake_urlopen)
-    deploy.supervisor_request("GET", "/test")
+    deploy.supervisor_request("GET", "/test", None, 30)
     assert captured["auth"] == f"Bearer {deploy.SUPERVISOR_TOKEN}"
+
+
+def test_non_2xx_with_json_body_is_error_variant(monkeypatch):
+    def raise_http_error(req, timeout=None):
+        raise http_error(502, json.dumps({"result": "error", "message": "down"}))
+
+    monkeypatch.setattr(deploy.urllib.request, "urlopen", raise_http_error)
+    outcome = deploy.supervisor_request("GET", "/test", None, 30)
+    assert isinstance(outcome, deploy.SupervisorError)
+    assert outcome.code == 502
+    assert outcome.body == {"result": "error", "message": "down"}
+
+
+def test_non_2xx_with_non_json_body_is_body_mismatch(monkeypatch):
+    def raise_http_error(req, timeout=None):
+        raise http_error(500, "oops")
+
+    monkeypatch.setattr(deploy.urllib.request, "urlopen", raise_http_error)
+    outcome = deploy.supervisor_request("GET", "/test", None, 30)
+    assert isinstance(outcome, deploy.SupervisorBodyMismatch)
+    assert outcome.code == 500
+    assert outcome.raw == "oops"
+
+
+def test_non_2xx_with_unreadable_body_is_body_mismatch(monkeypatch):
+    def raise_on_read():
+        raise OSError("no body")
+
+    err = urllib.error.HTTPError(
+        "http://supervisor/test", 503, "boom", email.message.Message(), None
+    )
+    monkeypatch.setattr(err, "read", raise_on_read)
+
+    def raise_http_error(req, timeout=None):
+        raise err
+
+    monkeypatch.setattr(deploy.urllib.request, "urlopen", raise_http_error)
+    outcome = deploy.supervisor_request("GET", "/test", None, 30)
+    assert isinstance(outcome, deploy.SupervisorBodyMismatch)
+    assert outcome.code == 503
+    assert outcome.raw == ""
+
+
+def test_network_error_is_unreachable_variant(monkeypatch):
+    def refused(req, timeout=None):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(deploy.urllib.request, "urlopen", refused)
+    outcome = deploy.supervisor_request("GET", "/test", None, 30)
+    assert isinstance(outcome, deploy.SupervisorUnreachable)
+    assert "connection refused" in outcome.reason

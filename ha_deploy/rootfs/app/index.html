@@ -24,10 +24,9 @@
       }
     }
     setInterval(updateTimer, 1000);
-    function setDeployEnabled(status) {
+    function setDeployEnabled(view) {
       const btn = document.getElementById('deploy');
-      const gateOk = status && status.fetch_ok && status.ahead === 0
-        && !status.changes.some(c => c.status !== '??');
+      const gateOk = !!(view && view.gate && view.gate.kind === 'gate-pass');
       btn.disabled = !gateOk;
       document.getElementById('deploy-status').textContent = gateOk
         ? ' (ready)' : ' (gate not clean - deploy disabled)';

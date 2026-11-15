@@ -1,32 +1,23 @@
-"""HA Deploy - clean deploy module.
+"""HA Deploy - clean deploy module, Elm-style.
 
 Implements the validated deploy flow:
   gate #1 -> backup -> stop core -> gate #2 -> pull -> verify -> start core
 with a try/finally restart safety net.
 
-Design decisions (from the plan):
-  - supervisor_request is defensive: it never raises. Network/timeout errors
-    return (code=-1, {"error": ...}). HTTPError bodies are parsed so a 502
-    body reaches the log. A non-JSON body is mapped to a body-mismatch value
-    instead of raising.
-  - One function per step. Each step catches its own exceptions and maps them
-    into a structured result: {"ok": bool, "error": str|None, ...} plus
-    step-specific fields. Errors never escape a step function.
-  - deploy() is the single entrypoint: it owns core_stopped (set immediately
-    after a successful stop) and the recovery decisions, and wraps everything
-    after a successful stop in try/finally.
-  - The /deploy route adds one last-resort catch: guarantee a JSON response,
-    log, no recovery.
-  - Logging uses the logging module (decided, Co): info for progress and
-    success, error for failures, warning for the finally safety net.
+Everything below the /deploy route's last-resort catch returns sum types
+(pydantic models with a `kind` tag in discriminated unions, consumed via
+`match`); nothing raises. Failure is a variant, never a None or a flag.
 
-Outcome mapping references (see plan):
-  - Supervisor API calls: 2xx -> ok; non-2xx / network (code=-1) -> fail;
-    2xx-but-unexpected-body -> fail.
-  - Git calls: rc=0 -> ok (pull additionally requires no CONFLICT / error: in
-    the output); rc!=0 or run_git exception -> fail.
-  - SSH key missing -> silent fallback to env={} (decided); the fetch then
-    fails and surfaces as an ordinary fetch/auth error.
+Design decisions (see plan-typing.md and AGENTS.md "Code style"):
+  - run_git maps subprocess outcomes into RunGitOutcome; git's exit code is
+    never read as a value (only zero/non-zero), so the variants carry the
+    streams only.
+  - supervisor_request maps HTTP/network outcomes into SupervisorOutcome;
+    the old code=-1 sentinel is gone - unreachable is its own variant.
+  - Per-endpoint decoders turn the Supervisor envelope into typed outcomes.
+  - GitState's variants ARE the classifications; there is no summary string
+    and no gate_ok flag - the gate verdict is a match over the state.
+  - deploy() returns one variant per flow-terminal point (DeployOutcome).
 """
 
 import contextlib
@@ -35,9 +26,12 @@ import logging
 import os
 import re
 import subprocess
-from typing import Any, TypedDict
+from typing import Annotated, Literal
 import urllib.error
 import urllib.request
+
+from pydantic import BaseModel, Field, JsonValue, TypeAdapter, ValidationError
+from typing_extensions import assert_never
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -49,85 +43,103 @@ SUPERVISOR_TOKEN = os.environ.get("SUPERVISOR_TOKEN", "")
 BACKUP_NAME = "pre-deploy"
 
 
-# --- result contracts (mirror tests/test_contracts.py) ----------------------
+# --- git subprocess outcome --------------------------------------------------
 
 
-class ChangeDict(TypedDict):
-    """One line of `git status --porcelain` output."""
+class RunGitSuccess(BaseModel):
+    """git ran with exit code 0; stderr can still carry progress/hints."""
 
-    status: str
-    path: str
-
-
-class StatusSummary(TypedDict):
-    """Result of git_status_summary: state classification + gate verdict."""
-
-    fetch_ok: bool
-    fetch_error: str
-    status_ok: bool
-    status_error: str
-    branch: str
-    ahead: int
-    behind: int
-    changes: list[ChangeDict]
-    summary: str
-    gate_ok: bool
+    kind: Literal["success"] = "success"
+    stdout: str
+    stderr: str
 
 
-class BackupResult(TypedDict):
-    """Result of create_backup."""
+class RunGitFailure(BaseModel):
+    """git ran and exited non-zero."""
 
-    ok: bool
-    slug: str | None
+    kind: Literal["failure"] = "failure"
+    stdout: str
+    stderr: str
+
+
+class RunGitException(BaseModel):
+    """git could not run at all (binary gone, timeout, ...)."""
+
+    kind: Literal["exception"] = "exception"
+    reason: str
+
+
+RunGitOutcome = Annotated[
+    RunGitSuccess | RunGitFailure | RunGitException,
+    Field(discriminator="kind"),
+]
+
+
+# --- supervisor boundary -----------------------------------------------------
+
+
+class SupervisorOk(BaseModel):
+    """2xx with a parseable JSON body."""
+
+    kind: Literal["ok"] = "ok"
     code: int
-    error: str | None
+    body: JsonValue
 
 
-class ControlResult(TypedDict):
-    """Result of stop_core / start_core."""
+class SupervisorError(BaseModel):
+    """non-2xx with a parseable JSON body."""
 
-    ok: bool
+    kind: Literal["error"] = "error"
     code: int
-    error: str | None
-    info: object | None
+    body: JsonValue
 
 
-class PullResult(TypedDict):
-    """Result of pull."""
+class SupervisorBodyMismatch(BaseModel):
+    """the body was not JSON (any status code)."""
 
-    ok: bool
-    rc: int
-    pull_output: str
-    error: str | None
-
-
-class VerifyResult(TypedDict):
-    """Result of verify."""
-
-    ok: bool
-    modified: list[str]
-    error: str | None
+    kind: Literal["body-mismatch"] = "body-mismatch"
+    code: int
+    raw: str
 
 
-# --- infrastructure ---------------------------------------------------------
+class SupervisorUnreachable(BaseModel):
+    """the Supervisor API could not be reached at all (network, timeout)."""
+
+    kind: Literal["unreachable"] = "unreachable"
+    reason: str
+
+
+SupervisorOutcome = Annotated[
+    SupervisorOk | SupervisorError | SupervisorBodyMismatch | SupervisorUnreachable,
+    Field(discriminator="kind"),
+]
+
+
+def _parse_supervisor_body(code: int, raw: str) -> SupervisorOutcome:
+    try:
+        parsed: JsonValue = json.loads(raw)
+    except Exception:
+        return SupervisorBodyMismatch(code=code, raw=raw[:500])
+    if 200 <= code < 300:
+        return SupervisorOk(code=code, body=parsed)
+    return SupervisorError(code=code, body=parsed)
 
 
 def supervisor_request(
-    method: str, path: str, data: dict[str, Any] | None = None, timeout: float = 30
-) -> tuple[int, dict[str, Any]]:
-    """Defensive Supervisor API call: returns (code, parsed_body); never raises.
+    method: str, path: str, body: JsonValue | None, timeout: float
+) -> SupervisorOutcome:
+    """Defensive Supervisor API call: returns an outcome; never raises.
 
-    code=-1 on network/timeout errors (counts as fail). HTTPError bodies are
-    parsed so a non-2xx body reaches the log. A non-JSON body is returned as
-    a body-mismatch value.
+    `body=None` is a real state: the request carries no JSON body. HTTPError
+    bodies are parsed so a non-2xx body reaches the log.
     """
     url = f"{SUPERVISOR}{path}"
     headers = {"Authorization": f"Bearer {SUPERVISOR_TOKEN}"}
-    body = None
-    if data is not None:
-        body = json.dumps(data).encode()
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
         headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             status = resp.status
@@ -136,25 +148,16 @@ def supervisor_request(
         raw = ""
         with contextlib.suppress(Exception):
             raw = e.read().decode(errors="replace")
-        try:
-            parsed: dict[str, Any] = json.loads(raw)
-        except Exception:
-            return e.code, {"error": "non-JSON error body", "raw": raw[:500]}
-        return e.code, parsed
+        return _parse_supervisor_body(e.code, raw)
     except Exception as e:
-        return -1, {"error": str(e)}
-    try:
-        parsed = json.loads(raw)
-    except Exception:
-        return status, {"error": "non-JSON response body", "raw": raw[:500]}
-    return status, parsed
+        return SupervisorUnreachable(reason=str(e))
+    return _parse_supervisor_body(status, raw)
 
 
-def run_git(args: list[str], env: dict[str, str] | None = None) -> tuple[int, str, str]:
-    """Run git in GIT_DIR. Returns (rc, stdout, stderr); never raises."""
+def run_git(args: list[str], env: dict[str, str]) -> RunGitOutcome:
+    """Run git in GIT_DIR. Returns an outcome; never raises."""
     e = dict(os.environ)
-    if env:
-        e.update(env)
+    e.update(env)
     try:
         r = subprocess.run(
             ["git", "-C", GIT_DIR, *args],
@@ -163,9 +166,11 @@ def run_git(args: list[str], env: dict[str, str] | None = None) -> tuple[int, st
             env=e,
             timeout=60,
         )
-        return r.returncode, r.stdout.strip(), r.stderr.strip()
     except Exception as ex:
-        return -1, "", str(ex)
+        return RunGitException(reason=str(ex))
+    if r.returncode == 0:
+        return RunGitSuccess(stdout=r.stdout.strip(), stderr=r.stderr.strip())
+    return RunGitFailure(stdout=r.stdout.strip(), stderr=r.stderr.strip())
 
 
 def derive_git_env() -> dict[str, str]:
@@ -178,23 +183,138 @@ def derive_git_env() -> dict[str, str]:
     return {"GIT_SSH_COMMAND": ssh_cmd} if os.path.exists(SSH_KEY) else {}
 
 
-# --- git state --------------------------------------------------------------
+# --- git state: the classifications are the variants -------------------------
 
 
-def git_status_summary(env: dict[str, str]) -> StatusSummary:
-    """Git fetch origin + git status --porcelain=v1 -b; classifies the state."""
-    rc, _out, err = run_git(["fetch", "origin"], env=env)
-    fetch_ok = rc == 0
-    fetch_error = err if not fetch_ok else ""
+class Change(BaseModel):
+    """One line of `git status --porcelain` output."""
 
-    rc2, branch_out, err2 = run_git(["status", "--porcelain=v1", "-b"], env=env)
-    status_ok = rc2 == 0
-    status_error = err2 if not status_ok else ""
-    branch = ""
+    status: str
+    path: str
+
+
+class Clean(BaseModel):
+    """no local changes, in sync with origin."""
+
+    kind: Literal["clean"] = "clean"
+
+
+class UntrackedOnly(BaseModel):
+    """only untracked files; deploys are allowed."""
+
+    kind: Literal["untracked-only"] = "untracked-only"
+    changes: list[Change]
+
+
+class OnlyAdditions(BaseModel):
+    """only staged/unstaged additions; deploy blocked."""
+
+    kind: Literal["only-additions"] = "only-additions"
+    changes: list[Change]
+
+
+class OnlyDeletions(BaseModel):
+    """only deletions; deploy blocked."""
+
+    kind: Literal["only-deletions"] = "only-deletions"
+    changes: list[Change]
+
+
+class ContainsUpdates(BaseModel):
+    """mixed modifications; deploy blocked."""
+
+    kind: Literal["contains-updates"] = "contains-updates"
+    changes: list[Change]
+
+
+class Diverged(BaseModel):
+    """local and origin have diverged; deploy blocked."""
+
+    kind: Literal["diverged"] = "diverged"
+    ahead: int
+    behind: int
+
+
+class BehindOrigin(BaseModel):
+    """origin is ahead; deploy allowed (pull brings it home)."""
+
+    kind: Literal["behind-origin"] = "behind-origin"
+    behind: int
+
+
+class AheadOfOrigin(BaseModel):
+    """local is ahead (unpushed commits); deploy blocked."""
+
+    kind: Literal["ahead-of-origin"] = "ahead-of-origin"
+    ahead: int
+
+
+class FetchFailed(BaseModel):
+    """git fetch failed for a non-auth reason."""
+
+    kind: Literal["fetch-failed"] = "fetch-failed"
+    reason: str
+
+
+class AuthError(BaseModel):
+    """git fetch failed on authentication."""
+
+    kind: Literal["auth-error"] = "auth-error"
+    reason: str
+
+
+class StatusFailed(BaseModel):
+    """git status itself failed."""
+
+    kind: Literal["status-failed"] = "status-failed"
+    reason: str
+
+
+GitState = Annotated[
+    Clean
+    | UntrackedOnly
+    | OnlyAdditions
+    | OnlyDeletions
+    | ContainsUpdates
+    | Diverged
+    | BehindOrigin
+    | AheadOfOrigin
+    | FetchFailed
+    | AuthError
+    | StatusFailed,
+    Field(discriminator="kind"),
+]
+
+
+class GitReport(BaseModel):
+    """What the two git calls saw.
+
+    branch is None exactly when no status output could be read (fetch/auth/
+    status failure) - a real absent state, not an empty string.
+    """
+
+    branch: str | None
+    state: GitState
+
+
+def _classify_fetch(stderr: str) -> FetchFailed | AuthError:
+    low = stderr.lower()
+    if (
+        "permission" in low
+        or "auth" in low
+        or "host key" in low
+        or "could not read" in low
+    ):
+        return AuthError(reason=stderr)
+    return FetchFailed(reason=stderr)
+
+
+def _classify_status(status_out: str) -> GitReport:
+    branch = None
     ahead = 0
     behind = 0
-    changes: list[ChangeDict] = []
-    for line in branch_out.splitlines():
+    changes: list[Change] = []
+    for line in status_out.splitlines():
         if line.startswith("##"):
             branch = line[2:].strip()
             m = re.search(r"ahead (\d+)", line)
@@ -204,373 +324,552 @@ def git_status_summary(env: dict[str, str]) -> StatusSummary:
             if m:
                 behind = int(m.group(1))
         elif line.strip():
-            changes.append({"status": line[:2].strip(), "path": line[3:].strip()})
+            changes.append(Change(status=line[:2].strip(), path=line[3:].strip()))
 
-    summary: str
-    if not fetch_ok:
-        low = fetch_error.lower()
-        if (
-            "permission" in low
-            or "auth" in low
-            or "host key" in low
-            or "could not read" in low
-        ):
-            summary = "auth error"
-        else:
-            summary = "fetch failed"
-    elif not status_ok:
-        summary = "status failed"
-    elif ahead > 0 and behind > 0:
-        summary = "diverged"
+    if ahead > 0 and behind > 0:
+        state: GitState = Diverged(ahead=ahead, behind=behind)
     elif behind > 0:
-        summary = "behind origin"
+        state = BehindOrigin(behind=behind)
     elif ahead > 0:
-        summary = "ahead of origin"
+        state = AheadOfOrigin(ahead=ahead)
     elif not changes:
-        summary = "clean"
+        state = Clean()
     else:
-        statuses = {c["status"] for c in changes}
+        statuses = {c.status for c in changes}
         if all(s == "??" for s in statuses):
-            summary = "untracked only"
+            state = UntrackedOnly(changes=changes)
         elif all(s in ("A", "AM", "??") for s in statuses):
-            summary = "only additions"
+            state = OnlyAdditions(changes=changes)
         elif all(s in ("D", "AD") for s in statuses):
-            summary = "only deletions"
+            state = OnlyDeletions(changes=changes)
         else:
-            summary = "contains updates"
+            state = ContainsUpdates(changes=changes)
 
-    # gate: deploy allowed only if fetch_ok, status_ok, ahead==0, no modified tracked files
-    gate_ok = (
-        fetch_ok
-        and status_ok
-        and ahead == 0
-        and not any(c["status"] != "??" for c in changes)
-    )
-
-    return {
-        "fetch_ok": fetch_ok,
-        "fetch_error": fetch_error,
-        "status_ok": status_ok,
-        "status_error": status_error,
-        "branch": branch,
-        "ahead": ahead,
-        "behind": behind,
-        "changes": changes,
-        "summary": summary,
-        "gate_ok": gate_ok,
-    }
+    return GitReport(branch=branch, state=state)
 
 
-def gate_check(env: dict[str, str]) -> tuple[bool, str, StatusSummary]:
-    """Gate rule: fetch_ok AND status_ok AND ahead==0 AND no non-?? changes.
+def git_status_summary(env: dict[str, str]) -> GitReport:
+    """Git fetch origin + git status --porcelain=v1 -b; classifies the state."""
+    match run_git(["fetch", "origin"], env):
+        case RunGitSuccess():
+            pass
+        case RunGitFailure(stdout=_, stderr=stderr):
+            return GitReport(branch=None, state=_classify_fetch(stderr))
+        case RunGitException(reason=reason):
+            return GitReport(branch=None, state=_classify_fetch(reason))
+        case never:
+            assert_never(never)
 
-    Returns (ok, reason, status_dict).
+    match run_git(["status", "--porcelain=v1", "-b"], env):
+        case RunGitSuccess(stdout=stdout):
+            return _classify_status(stdout)
+        case RunGitFailure(stdout=_, stderr=stderr):
+            return GitReport(branch=None, state=StatusFailed(reason=stderr))
+        case RunGitException(reason=reason):
+            return GitReport(branch=None, state=StatusFailed(reason=reason))
+        case never:
+            assert_never(never)
+
+
+# --- gate --------------------------------------------------------------------
+
+
+class GatePass(BaseModel):
+    """the deploy gate is open: clean, untracked-only or behind origin."""
+
+    kind: Literal["gate-pass"] = "gate-pass"
+
+
+class GateBlocked(BaseModel):
+    """the deploy gate is closed, with the reason and the state behind it."""
+
+    kind: Literal["gate-blocked"] = "gate-blocked"
+    reason: str
+    state: GitState
+
+
+GateVerdict = Annotated[GatePass | GateBlocked, Field(discriminator="kind")]
+
+
+def gate_verdict(state: GitState) -> GateVerdict:
+    """The gate rule as a match over every state; exhaustive."""
+    match state:
+        case Clean() | UntrackedOnly() | BehindOrigin():
+            return GatePass()
+        case AheadOfOrigin() | Diverged():
+            return GateBlocked(
+                reason="local is ahead of origin (unpushed commits) - resolve manually or publish first",
+                state=state,
+            )
+        case OnlyAdditions() | OnlyDeletions() | ContainsUpdates():
+            return GateBlocked(
+                reason="modified tracked files present - resolve manually first",
+                state=state,
+            )
+        case FetchFailed(reason=reason) | AuthError(reason=reason):
+            return GateBlocked(reason=f"fetch failed: {reason}", state=state)
+        case StatusFailed(reason=reason):
+            return GateBlocked(reason=f"status failed: {reason}", state=state)
+        case never:
+            assert_never(never)
+
+
+def gate_check(env: dict[str, str]) -> GateVerdict:
+    """Gate rule: clean/untracked-only/behind pass; everything else blocks."""
+    return gate_verdict(git_status_summary(env).state)
+
+
+# --- steps -------------------------------------------------------------------
+
+
+class _SupervisorEnvelope(BaseModel):
+    """The envelope Supervisor endpoints answer with; only data is needed."""
+
+    data: JsonValue
+
+
+class _BackupBySlug(BaseModel):
+    slug: str
+
+
+class _BackupByName(BaseModel):
+    name: str
+
+
+_BackupData: TypeAdapter[_BackupBySlug | _BackupByName] = TypeAdapter(
+    _BackupBySlug | _BackupByName
+)
+
+
+def _backup_slug(body: JsonValue) -> str:
+    """Decode the backup identifier from the /backups/new/full body.
+
+    Raises ValidationError on a body mismatch - create_backup catches it.
     """
-    st = git_status_summary(env)
-    if not st["fetch_ok"]:
-        return False, f"fetch failed: {st['fetch_error']}", st
-    if not st["status_ok"]:
-        return False, f"status failed: {st['status_error']}", st
-    if st["ahead"] > 0:
-        return (
-            False,
-            "local is ahead of origin (unpushed commits) - resolve manually or publish first",
-            st,
-        )
-    if any(c["status"] != "??" for c in st["changes"]):
-        return False, "modified tracked files present - resolve manually first", st
-    return True, "clean", st
+    payload = _SupervisorEnvelope.model_validate(body).data
+    match _BackupData.validate_python(payload):
+        case _BackupBySlug(slug=slug):
+            return slug
+        case _BackupByName(name=name):
+            return name
+        case never:
+            assert_never(never)
 
 
-# --- steps ------------------------------------------------------------------
+class BackupCreated(BaseModel):
+    """the full backup was taken; slug identifies it (name fallback kept)."""
+
+    kind: Literal["backup-created"] = "backup-created"
+    slug: str
 
 
-def create_backup() -> BackupResult:
-    """POST /backups/new/full. Blocks until the backup is done (decided, D2).
+class BackupFailed(BaseModel):
+    """the backup API call failed for any reason; reason carries the detail."""
 
-    Returns {"ok", "slug", "code", "error"}.
-    """
-    result: BackupResult = {"ok": False, "slug": None, "code": -1, "error": None}
+    kind: Literal["backup-failed"] = "backup-failed"
+    reason: str
+
+
+def create_backup() -> BackupCreated | BackupFailed:
+    """POST /backups/new/full. Blocks until the backup is done (decided, D2)."""
+    _LOGGER.info("DEPLOY: creating full backup")
+    match supervisor_request(
+        "POST", "/backups/new/full", {"name": BACKUP_NAME}, timeout=300
+    ):
+        case SupervisorOk(code=_, body=body):
+            try:
+                slug = _backup_slug(body)
+            except ValidationError:
+                _LOGGER.error("DEPLOY: backup body mismatch: %s", body)
+                return BackupFailed(
+                    reason=f"backup API returned unexpected body (no slug): {body}"
+                )
+            _LOGGER.info("DEPLOY: backup created slug=%s", slug)
+            return BackupCreated(slug=slug)
+        case SupervisorError(code=code, body=body):
+            _LOGGER.error("DEPLOY: backup failed code=%s body=%s", code, body)
+            return BackupFailed(reason=f"backup API returned {code}: {body}")
+        case SupervisorBodyMismatch(code=code, raw=raw):
+            _LOGGER.error(
+                "DEPLOY: backup failed code=%s with non-JSON body %r", code, raw
+            )
+            return BackupFailed(
+                reason=f"backup API returned {code} with a non-JSON body: {raw}"
+            )
+        case SupervisorUnreachable(reason=reason):
+            _LOGGER.error("DEPLOY: backup API unreachable: %s", reason)
+            return BackupFailed(reason=f"backup API unreachable: {reason}")
+        case never:
+            assert_never(never)
+
+
+class CoreStopped(BaseModel):
+    """POST /core/stop answered 2xx."""
+
+    kind: Literal["core-stopped"] = "core-stopped"
+
+
+class CoreStopFailed(BaseModel):
+    """the core could not be stopped; reason carries the detail."""
+
+    kind: Literal["core-stop-failed"] = "core-stop-failed"
+    reason: str
+
+
+def stop_core() -> CoreStopped | CoreStopFailed:
+    """POST /core/stop - synchronous control call (2xx == stopped, no polling)."""
+    match supervisor_request("POST", "/core/stop", None, timeout=30):
+        case SupervisorOk():
+            return CoreStopped()
+        case SupervisorError(code=code, body=body):
+            _LOGGER.error("DEPLOY: stop failed code=%s body=%s", code, body)
+            return CoreStopFailed(reason=f"core stop returned {code}: {body}")
+        case SupervisorBodyMismatch(code=code, raw=raw):
+            _LOGGER.error(
+                "DEPLOY: stop failed code=%s with non-JSON body %r", code, raw
+            )
+            return CoreStopFailed(
+                reason=f"core stop returned {code} with a non-JSON body: {raw}"
+            )
+        case SupervisorUnreachable(reason=reason):
+            _LOGGER.error("DEPLOY: stop failed, unreachable: %s", reason)
+            return CoreStopFailed(reason=f"core stop unreachable: {reason}")
+        case never:
+            assert_never(never)
+
+
+class CoreStarted(BaseModel):
+    """POST /core/start answered 2xx."""
+
+    kind: Literal["core-started"] = "core-started"
+
+
+class CoreStartFailed(BaseModel):
+    """the core could not be started; reason carries the detail."""
+
+    kind: Literal["core-start-failed"] = "core-start-failed"
+    reason: str
+
+
+def start_core() -> CoreStarted | CoreStartFailed:
+    """POST /core/start - synchronous control call (2xx == started, no polling)."""
+    match supervisor_request("POST", "/core/start", None, timeout=30):
+        case SupervisorOk():
+            return CoreStarted()
+        case SupervisorError(code=code, body=body):
+            _LOGGER.error("DEPLOY: start failed code=%s body=%s", code, body)
+            return CoreStartFailed(reason=f"core start returned {code}: {body}")
+        case SupervisorBodyMismatch(code=code, raw=raw):
+            _LOGGER.error(
+                "DEPLOY: start failed code=%s with non-JSON body %r", code, raw
+            )
+            return CoreStartFailed(
+                reason=f"core start returned {code} with a non-JSON body: {raw}"
+            )
+        case SupervisorUnreachable(reason=reason):
+            _LOGGER.error("DEPLOY: start failed, unreachable: %s", reason)
+            return CoreStartFailed(reason=f"core start unreachable: {reason}")
+        case never:
+            assert_never(never)
+
+
+def _git_output(stdout: str, stderr: str) -> str:
+    return (stdout + ("\n" + stderr if stderr else "")).strip()
+
+
+class Pulled(BaseModel):
+    """git pull succeeded without conflict/error markers; output is its text."""
+
+    kind: Literal["pulled"] = "pulled"
+    output: str
+
+
+class PullFailed(BaseModel):
+    """git pull failed or produced conflict/error markers."""
+
+    kind: Literal["pull-failed"] = "pull-failed"
+    output: str
+    reason: str
+
+
+def pull(env: dict[str, str]) -> Pulled | PullFailed:
+    """Git pull. Success AND no CONFLICT AND no error marker in the output."""
+    _LOGGER.info("DEPLOY: running git pull")
+    match run_git(["pull"], env):
+        case RunGitSuccess(stdout=stdout, stderr=stderr):
+            output = _git_output(stdout, stderr)
+            _LOGGER.info("DEPLOY: git pull output=%r", output)
+            if "CONFLICT" in output or "error:" in output.lower():
+                return PullFailed(output=output, reason="git pull failed")
+            return Pulled(output=output)
+        case RunGitFailure(stdout=stdout, stderr=stderr):
+            output = _git_output(stdout, stderr)
+            _LOGGER.info("DEPLOY: git pull output=%r", output)
+            return PullFailed(output=output, reason="git pull failed")
+        case RunGitException(reason=reason):
+            _LOGGER.error("DEPLOY: git pull exception: %s", reason)
+            return PullFailed(output="", reason=reason)
+        case never:
+            assert_never(never)
+
+
+class VerifiedClean(BaseModel):
+    """post-pull status shows no tracked changes."""
+
+    kind: Literal["verified-clean"] = "verified-clean"
+
+
+class VerifyFailed(BaseModel):
+    """tracked changes appeared after the pull."""
+
+    kind: Literal["verify-failed"] = "verify-failed"
+    modified: list[str]
+    reason: str
+
+
+def verify(env: dict[str, str]) -> VerifiedClean | VerifyFailed:
+    """Post-pull verify: git status --porcelain, zero non-?? lines -> clean."""
+    match run_git(["status", "--porcelain"], env):
+        case RunGitSuccess(stdout=stdout):
+            modified = [
+                entry
+                for entry in stdout.splitlines()
+                if entry.strip() and not entry.startswith("??")
+            ]
+            if modified:
+                _LOGGER.error(
+                    "DEPLOY: unexpected tracked changes after pull: %s", modified
+                )
+                return VerifyFailed(
+                    modified=modified, reason="unexpected tracked changes after pull"
+                )
+            _LOGGER.info("DEPLOY: post-pull verify ok")
+            return VerifiedClean()
+        case RunGitFailure(stdout=_, stderr=stderr):
+            _LOGGER.error("DEPLOY: verify failed: %s", stderr)
+            return VerifyFailed(modified=[], reason=f"git status failed: {stderr}")
+        case RunGitException(reason=reason):
+            _LOGGER.error("DEPLOY: verify failed: %s", reason)
+            return VerifyFailed(modified=[], reason=reason)
+        case never:
+            assert_never(never)
+
+
+# --- orchestrator: one variant per flow-terminal point -----------------------
+
+
+class BlockedBeforeBackup(BaseModel):
+    """gate #1 failed; nothing stopped, no backup taken."""
+
+    kind: Literal["blocked-before-backup"] = "blocked-before-backup"
+    state: GitState
+
+
+class BlockedByBackup(BaseModel):
+    """the backup failed; nothing stopped."""
+
+    kind: Literal["blocked-by-backup"] = "blocked-by-backup"
+    reason: str
+
+
+class BlockedByStop(BaseModel):
+    """the core could not be stopped; it is presumably still running."""
+
+    kind: Literal["blocked-by-stop"] = "blocked-by-stop"
+    reason: str
+    backup: str
+
+
+class BlockedAfterStop(BaseModel):
+    """gate #2 failed after the stop; the core was restarted."""
+
+    kind: Literal["blocked-after-stop"] = "blocked-after-stop"
+    state: GitState
+    backup: str
+
+
+class BlockedByPull(BaseModel):
+    """git pull failed; the core was restarted."""
+
+    kind: Literal["blocked-by-pull"] = "blocked-by-pull"
+    output: str
+    backup: str
+
+
+class BlockedByVerify(BaseModel):
+    """unexpected tracked changes after the pull; the core was restarted."""
+
+    kind: Literal["blocked-by-verify"] = "blocked-by-verify"
+    output: str
+    modified: list[str]
+    backup: str
+
+
+class BlockedByStart(BaseModel):
+    """the core could not be started again; the finally still tried."""
+
+    kind: Literal["blocked-by-start"] = "blocked-by-start"
+    reason: str
+    output: str
+    backup: str
+
+
+class DeploySucceeded(BaseModel):
+    """the whole flow completed: backup taken, code pulled, core started."""
+
+    kind: Literal["deploy-succeeded"] = "deploy-succeeded"
+    output: str
+    backup: str
+
+
+class RouteCrash(BaseModel):
+    """The last-resort catch's answer: deploy() itself raised (a bug, not a flow end)."""
+
+    kind: Literal["route-crash"] = "route-crash"
+    reason: str
+
+
+DeployOutcome = Annotated[
+    BlockedBeforeBackup
+    | BlockedByBackup
+    | BlockedByStop
+    | BlockedAfterStop
+    | BlockedByPull
+    | BlockedByVerify
+    | BlockedByStart
+    | DeploySucceeded,
+    Field(discriminator="kind"),
+]
+
+
+def _restart_core() -> CoreStarted | CoreStartFailed:
+    """start_core() with the old restart-result logging (recovery paths)."""
+    outcome = start_core()
+    match outcome:
+        case CoreStarted():
+            _LOGGER.info("DEPLOY: start result: ok")
+        case CoreStartFailed(reason=reason):
+            _LOGGER.error("DEPLOY: start result: failed: %s", reason)
+        case never:
+            assert_never(never)
+    return outcome
+
+
+def _backup_taken_phase(backup: str, env: dict[str, str]) -> DeployOutcome:
+    """Everything after a successful backup; owns core_stopped + the finally."""
+    core_stopped = False
     try:
-        _LOGGER.info("DEPLOY: creating full backup")
-        code, info = supervisor_request(
-            "POST", "/backups/new/full", {"name": BACKUP_NAME}, timeout=300
-        )
-        result["code"] = code
-        if not (200 <= code < 300):
-            result["error"] = f"backup API returned {code}: {info}"
-            _LOGGER.error("DEPLOY: backup failed code=%s info=%s", code, info)
-            return result
-        data = info.get("data") if isinstance(info, dict) else None
-        slug = (
-            (data.get("slug") or data.get("name")) if isinstance(data, dict) else None
-        )
-        if not slug:
-            result["error"] = f"backup API returned unexpected body (no slug): {info}"
-            _LOGGER.error("DEPLOY: backup body mismatch: %s", info)
-            return result
-        result["ok"] = True
-        result["slug"] = slug
-        _LOGGER.info("DEPLOY: backup created slug=%s", slug)
-        return result
-    except Exception as ex:
-        result["error"] = f"unexpected error in create_backup: {ex!r}"
-        _LOGGER.error("DEPLOY: create_backup unexpected error: %r", ex)
-        return result
+        # Stop HA core. Fail -> return without starting: the core is
+        # presumably still running (decided).
+        _LOGGER.info("DEPLOY: stopping ha core")
+        match stop_core():
+            case CoreStopped():
+                core_stopped = True
+            case CoreStopFailed(reason=reason):
+                return BlockedByStop(reason=reason, backup=backup)
+            case never:
+                assert_never(never)
+
+        # Gate #2 (after stop). Fail -> start, return.
+        _LOGGER.info("DEPLOY: running after-stop check (gate #2)")
+        match gate_check(env):
+            case GatePass():
+                pass
+            case GateBlocked(reason=reason, state=state):
+                _LOGGER.error(
+                    "DEPLOY: after-stop check was not fine, will return error but first will start ha core"
+                )
+                _ = _restart_core()
+                return BlockedAfterStop(state=state, backup=backup)
+            case never:
+                assert_never(never)
+
+        match pull(env):
+            case Pulled(output=pulled_output):
+                match verify(env):
+                    case VerifiedClean():
+                        # Start HA core. Success clears the finally's restart.
+                        _LOGGER.info("DEPLOY: starting ha core")
+                        match start_core():
+                            case CoreStarted():
+                                core_stopped = False
+                                _LOGGER.info("DEPLOY: ===== deploy finished OK =====")
+                                return DeploySucceeded(
+                                    output=pulled_output, backup=backup
+                                )
+                            case CoreStartFailed(reason=reason):
+                                _LOGGER.error(
+                                    "DEPLOY: start failed - returning: %s", reason
+                                )
+                                return BlockedByStart(
+                                    reason=reason, output=pulled_output, backup=backup
+                                )
+                            case never:
+                                assert_never(never)
+                    case VerifyFailed(modified=modified):
+                        _LOGGER.error(
+                            "DEPLOY: verify was not fine, will return error but first will start ha core"
+                        )
+                        _ = _restart_core()
+                        return BlockedByVerify(
+                            output=pulled_output, modified=modified, backup=backup
+                        )
+                    case never:
+                        assert_never(never)
+            case PullFailed(output=output):
+                _LOGGER.error(
+                    "DEPLOY: pull was not fine, will return error but first will start ha core"
+                )
+                _ = _restart_core()
+                return BlockedByPull(output=output, backup=backup)
+            case never:
+                assert_never(never)
+    finally:
+        # Safety net for ANY exception after a successful stop - this exact
+        # gap is what broke the old code, because core_stopped stayed False
+        # there.
+        if core_stopped:
+            _LOGGER.warning("DEPLOY: finally - core was stopped, restarting")
+            _ = _restart_core()
 
 
-def stop_core() -> ControlResult:
-    """POST /core/stop - synchronous control call (2xx == stopped, no polling).
-
-    Returns {"ok", "code", "error", "info"}.
-    """
-    result: ControlResult = {"ok": False, "code": -1, "error": None, "info": None}
-    try:
-        code, info = supervisor_request("POST", "/core/stop", timeout=30)
-        result["code"] = code
-        result["info"] = info
-        if not (200 <= code < 300):
-            result["error"] = f"core stop returned {code}: {info}"
-            _LOGGER.error("DEPLOY: stop failed code=%s info=%s", code, info)
-            return result
-        result["ok"] = True
-        return result
-    except Exception as ex:
-        result["error"] = f"unexpected error in stop_core: {ex!r}"
-        _LOGGER.error("DEPLOY: stop_core unexpected error: %r", ex)
-        return result
-
-
-def start_core() -> ControlResult:
-    """POST /core/start - synchronous control call (2xx == started, no polling).
-
-    Returns {"ok", "code", "error", "info"}.
-    """
-    result: ControlResult = {"ok": False, "code": -1, "error": None, "info": None}
-    try:
-        code, info = supervisor_request("POST", "/core/start", timeout=30)
-        result["code"] = code
-        result["info"] = info
-        if not (200 <= code < 300):
-            result["error"] = f"core start returned {code}: {info}"
-            _LOGGER.error("DEPLOY: start failed code=%s info=%s", code, info)
-            return result
-        result["ok"] = True
-        return result
-    except Exception as ex:
-        result["error"] = f"unexpected error in start_core: {ex!r}"
-        _LOGGER.error("DEPLOY: start_core unexpected error: %r", ex)
-        return result
-
-
-def pull(env: dict[str, str]) -> PullResult:
-    """Git pull. rc=0 AND no CONFLICT AND no error: in output -> ok.
-
-    Returns {"ok", "rc", "pull_output", "error"}.
-    """
-    result: PullResult = {"ok": False, "rc": -1, "pull_output": "", "error": None}
-    try:
-        _LOGGER.info("DEPLOY: running git pull")
-        rc, out, err = run_git(["pull"], env=env)
-        pull_output = (out + ("\n" + err if err else "")).strip()
-        result["rc"] = rc
-        result["pull_output"] = pull_output
-        _LOGGER.info("DEPLOY: git pull rc=%s output=%r", rc, pull_output)
-        if rc != 0 or "CONFLICT" in (out + err) or "error:" in (out + err).lower():
-            result["error"] = "git pull failed"
-            return result
-        result["ok"] = True
-        return result
-    except Exception as ex:
-        result["error"] = f"unexpected error in pull: {ex!r}"
-        _LOGGER.error("DEPLOY: pull unexpected error: %r", ex)
-        return result
-
-
-def verify(env: dict[str, str]) -> VerifyResult:
-    """Post-pull verify: git status --porcelain, zero non-?? lines -> ok.
-
-    Returns {"ok", "modified", "error"}.
-    """
-    result: VerifyResult = {"ok": False, "modified": [], "error": None}
-    try:
-        rc, out, err = run_git(["status", "--porcelain"], env=env)
-        if rc != 0:
-            result["error"] = f"git status failed rc={rc}: {err}"
-            _LOGGER.error("DEPLOY: verify failed: %s", result["error"])
-            return result
-        modified = [
-            entry
-            for entry in out.splitlines()
-            if entry.strip() and not entry.startswith("??")
-        ]
-        if modified:
-            result["modified"] = modified
-            result["error"] = "unexpected tracked changes after pull"
-            _LOGGER.error("DEPLOY: unexpected tracked changes after pull: %s", modified)
-            return result
-        _LOGGER.info("DEPLOY: post-pull verify ok")
-        result["ok"] = True
-        return result
-    except Exception as ex:
-        result["error"] = f"unexpected error in verify: {ex!r}"
-        _LOGGER.error("DEPLOY: verify unexpected error: %r", ex)
-        return result
-
-
-# --- orchestrator -----------------------------------------------------------
-
-
-def deploy() -> dict[str, Any]:
-    """Single entrypoint. Straight-line steps; owns core_stopped + recovery."""
+def deploy() -> DeployOutcome:
+    """Single entrypoint. Straight-line steps; the stopped phase owns recovery."""
     _LOGGER.info("DEPLOY: ===== deploy started =====")
     env = derive_git_env()
 
-    # Step 1: pre-stop gate check (gate #1). Fail -> return. Nothing stopped
-    # yet, so no core action is needed.
+    # Gate #1 (pre-stop). Fail -> return; nothing stopped, no core action.
     _LOGGER.info("DEPLOY: running pre-check (gate #1)")
-    ok, reason, st = gate_check(env)
-    _LOGGER.info("DEPLOY: gate #1 result: ok=%s reason=%s", ok, reason)
-    if not ok:
-        _LOGGER.error("DEPLOY: gate #1 failed - returning")
-        return {"ok": False, "error": f"gate failed: {reason}", "status": st}
-    _LOGGER.info("DEPLOY: pre-check OK")
+    match gate_check(env):
+        case GatePass():
+            _LOGGER.info("DEPLOY: pre-check OK")
+        case GateBlocked(reason=reason, state=state):
+            _LOGGER.error("DEPLOY: gate #1 failed - returning: %s", reason)
+            return BlockedBeforeBackup(state=state)
+        case never:
+            assert_never(never)
 
-    # Step 2: create HA backup. Fail -> return.
-    b = create_backup()
-    _LOGGER.info(
-        "DEPLOY: backup result: ok=%s slug=%s code=%s", b["ok"], b["slug"], b["code"]
-    )
-    if not b["ok"]:
-        return {"ok": False, "error": f"backup failed: {b['error']}", "backup": None}
-    backup_slug = b["slug"]
+    match create_backup():
+        case BackupCreated(slug=slug):
+            return _backup_taken_phase(slug, env)
+        case BackupFailed(reason=reason):
+            _LOGGER.error("DEPLOY: backup failed - returning: %s", reason)
+            return BlockedByBackup(reason=reason)
+        case never:
+            assert_never(never)
 
-    core_stopped = False
-    try:
-        # Step 3: stop HA core. Fail -> return with core_stopped=False.
-        # Do NOT start: the core is presumably still running.
-        _LOGGER.info("DEPLOY: stopping ha core")
-        s = stop_core()
-        _LOGGER.info(
-            "DEPLOY: stop result: ok=%s code=%s error=%s",
-            s["ok"],
-            s["code"],
-            s["error"],
-        )
-        if not s["ok"]:
-            return {
-                "ok": False,
-                "error": f"failed to stop core: {s['error']}",
-                "backup": backup_slug,
-            }
-        # Set immediately after a successful stop, BEFORE anything else, so any
-        # exception further down still triggers the finally restart.
-        core_stopped = True
 
-        # Step 4: after-stop gate check (gate #2). Fail -> start, return.
-        _LOGGER.info("DEPLOY: running after-stop check (gate #2)")
-        ok2, reason2, st2 = gate_check(env)
-        _LOGGER.info("DEPLOY: after-stop check result: ok=%s reason=%s", ok2, reason2)
-        if not ok2:
-            _LOGGER.error(
-                "DEPLOY: after-stop check was not fine, will return error "
-                "but first will start ha core"
-            )
-            r = start_core()
-            _LOGGER.info(
-                "DEPLOY: restart result: ok=%s code=%s error=%s",
-                r["ok"],
-                r["code"],
-                r["error"],
-            )
-            return {
-                "ok": False,
-                "error": f"post-stop gate failed: {reason2}",
-                "status": st2,
-                "backup": backup_slug,
-            }
+# --- status view -------------------------------------------------------------
 
-        # Step 5: git pull. Fail -> start, return.
-        p = pull(env)
-        _LOGGER.info("DEPLOY: pull result: ok=%s rc=%s", p["ok"], p["rc"])
-        if not p["ok"]:
-            _LOGGER.error(
-                "DEPLOY: pull was not fine, will return error "
-                "but first will start ha core"
-            )
-            r = start_core()
-            _LOGGER.info(
-                "DEPLOY: restart result: ok=%s code=%s error=%s",
-                r["ok"],
-                r["code"],
-                r["error"],
-            )
-            return {
-                "ok": False,
-                "error": "git pull failed",
-                "pull_output": p["pull_output"],
-                "backup": backup_slug,
-            }
 
-        # Step 6: post-pull verify. Fail -> start, return.
-        v = verify(env)
-        _LOGGER.info("DEPLOY: verify result: ok=%s modified=%s", v["ok"], v["modified"])
-        if not v["ok"]:
-            _LOGGER.error(
-                "DEPLOY: verify was not fine, will return error "
-                "but first will start ha core"
-            )
-            r = start_core()
-            _LOGGER.info(
-                "DEPLOY: restart result: ok=%s code=%s error=%s",
-                r["ok"],
-                r["code"],
-                r["error"],
-            )
-            return {
-                "ok": False,
-                "error": "unexpected tracked changes after pull",
-                "modified": v["modified"],
-                "pull_output": p["pull_output"],
-                "backup": backup_slug,
-            }
+class StatusView(BaseModel):
+    """What /status serves: the report plus the gate verdict over its state."""
 
-        # Step 7: start HA core. Fail -> return; core stays stopped and the
-        # finally will still attempt a start.
-        _LOGGER.info("DEPLOY: starting ha core")
-        f = start_core()
-        _LOGGER.info(
-            "DEPLOY: start result: ok=%s code=%s error=%s",
-            f["ok"],
-            f["code"],
-            f["error"],
-        )
-        if not f["ok"]:
-            return {
-                "ok": False,
-                "error": f"failed to start core: {f['error']}",
-                "pull_output": p["pull_output"],
-                "backup": backup_slug,
-            }
-        core_stopped = False
-        _LOGGER.info("DEPLOY: ===== deploy finished OK =====")
-        return {
-            "ok": True,
-            "pull_output": p["pull_output"],
-            "backup": backup_slug,
-            "started": True,
-        }
+    report: GitReport
+    gate: GateVerdict
 
-    finally:
-        # Safety net for ANY exception after a successful stop (e.g. a stray
-        # broken-pipe from /health) - this exact gap is what broke the old
-        # code, because core_stopped stayed False there.
-        if core_stopped:
-            _LOGGER.warning("DEPLOY: finally - core was stopped, restarting")
-            r = start_core()
-            _LOGGER.warning(
-                "DEPLOY: finally restart result: ok=%s code=%s error=%s",
-                r["ok"],
-                r["code"],
-                r["error"],
-            )
+
+def status_view(env: dict[str, str]) -> StatusView:
+    """One git pass, both consumers: the report plus the gate over its state."""
+    report = git_status_summary(env)
+    return StatusView(report=report, gate=gate_verdict(report.state))
