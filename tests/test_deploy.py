@@ -88,6 +88,7 @@ def test_happy_path_order_and_single_restart(monkeypatch):
     assert result["ok"] is True
     assert result["backup"] == "abc123"
     assert result["pull_output"] == "updated"
+    assert result["started"] is True
     assert names(calls) == [
         "gate_check",
         "create_backup",
@@ -162,6 +163,7 @@ def test_gate2_fail_starts_core_before_returning(monkeypatch):
     result = deploy.deploy()
     assert result["ok"] is False
     assert "post-stop gate failed" in result["error"]
+    assert result["status"]["summary"] == "changed after stop"
     assert result["backup"] == "abc123"
     assert names(calls).count("start_core") == 2  # explicit + finally
 

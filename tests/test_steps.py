@@ -92,6 +92,15 @@ def test_backup_unexpected_exception_is_mapped(monkeypatch):
     assert "boom" in b["error"]
 
 
+def test_backup_non_dict_json_body_fails(monkeypatch):
+    # Valid JSON that is not an object (e.g. an array) must hit the body
+    # mismatch, not crash on .get().
+    monkeypatch.setattr(deploy, "supervisor_request", fake_supervisor(200, []))
+    b = deploy.create_backup()
+    assert b["ok"] is False
+    assert "unexpected body" in b["error"]
+
+
 # --- stop_core / start_core -------------------------------------------------
 
 
@@ -194,6 +203,20 @@ def test_pull_conflict_in_output_fails(monkeypatch):
     )
     p = deploy.pull({})
     assert p["ok"] is False
+
+
+def test_pull_conflict_marker_alone_fails(monkeypatch):
+    # Isolates the CONFLICT branch: rc=0 but merge-conflict markers in output.
+    # (The rc=1 conflict test short-circuits on rc != 0 and proves nothing
+    # about this check on its own.)
+    monkeypatch.setattr(
+        deploy,
+        "run_git",
+        fake_git({("pull",): (0, "CONFLICT (content): Merge conflict in f", "")}),
+    )
+    p = deploy.pull({})
+    assert p["ok"] is False
+    assert p["rc"] == 0
 
 
 def test_pull_error_marker_in_output_fails(monkeypatch):

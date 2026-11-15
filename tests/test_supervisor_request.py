@@ -122,6 +122,20 @@ def test_2xx_with_non_json_body_maps_to_body_mismatch_value(monkeypatch):
     assert info["raw"] == "<html>not json</html>"
 
 
+def test_valid_json_non_dict_body_passes_through(monkeypatch):
+    # json.loads succeeds on "[]" / "null" even though the contract says dict;
+    # the pass-through is pinned here, and the steps' isinstance guards are
+    # what keep it safe (see test_steps.test_backup_non_dict_json_body_fails).
+    monkeypatch.setattr(
+        deploy.urllib.request,
+        "urlopen",
+        lambda req, timeout=None: FakeResponse(200, "[]"),
+    )
+    code, info = deploy.supervisor_request("GET", "/test")
+    assert code == 200
+    assert info == []
+
+
 def test_bearer_token_header_is_set(monkeypatch):
     captured = {}
 

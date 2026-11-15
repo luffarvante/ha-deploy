@@ -122,6 +122,16 @@ def test_status_failure_fails_gate(monkeypatch):
     assert st["gate_ok"] is False
 
 
+def test_upstream_gone_currently_classified_clean(monkeypatch):
+    # Known gap: '[gone]' has no ahead/behind match and no changes, so the
+    # classifier calls it clean and the gate passes; the pull then fails
+    # downstream. Pinned so a future classification fix flips this test
+    # deliberately rather than silently.
+    st, _ = summarize(monkeypatch, status_out="## main...origin/main [gone]")
+    assert st["summary"] == "clean"
+    assert st["gate_ok"] is True
+
+
 def test_gate_check_clean(monkeypatch):
     run_git, _ = make_run_git(status_out="## main...origin/main")
     monkeypatch.setattr(deploy, "run_git", run_git)
