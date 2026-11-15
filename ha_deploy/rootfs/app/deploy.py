@@ -35,9 +35,11 @@ import logging
 import os
 import re
 import subprocess
-from typing import Any, TypedDict
+from typing import Any, TypedDict, Literal, Annotated
 import urllib.error
 import urllib.request
+
+from pydantic import BaseModel, Field
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -109,6 +111,41 @@ class VerifyResult(TypedDict):
     error: str | None
 
 
+class RunGitSuccess(BaseModel):
+    kind: Literal["success"] = "success"
+    stdout: str
+    # exit code is always 0
+
+
+class RunGitError(BaseModel):
+    kind: Literal["error"] = "error"
+    stdout: str
+    stderr: str
+    exit_code: int
+
+
+class RunGitException(BaseModel):
+    kind: Literal["error"] = "error"
+    exception: Exception
+    # exit code is always -1 (if relevant even)
+
+
+RunGitOutcome = Annotated[
+    RunGitSuccess | RunGitError | RunGitException,
+    Field(discriminator="kind")
+]
+
+
+def return_code_from_git_run(rgo: RunGitOutcome) -> int:
+    match rgo:
+        case RunGitSuccess():
+            return 0
+        case RunGitError(exit_code=exit_code):
+            return exit_code
+        case RunGitException():
+            return -1
+
+
 # --- infrastructure ---------------------------------------------------------
 
 
@@ -150,7 +187,7 @@ def supervisor_request(
     return status, parsed
 
 
-def run_git(args: list[str], env: dict[str, str] | None = None) -> tuple[int, str, str]:
+def run_git(args: list[str], env: dict[str, str] | None = None) -> RunGitOutcome:
     """Run git in GIT_DIR. Returns (rc, stdout, stderr); never raises."""
     e = dict(os.environ)
     if env:
@@ -163,9 +200,11 @@ def run_git(args: list[str], env: dict[str, str] | None = None) -> tuple[int, st
             env=e,
             timeout=60,
         )
-        return r.returncode, r.stdout.strip(), r.stderr.strip()
+        if r.returncode == 0:
+            return RunGitSuccess(stdout=r.stdout.strip())
+        return RunGitError(stdout=r.stdout.strip(), stderr=r.stderr.strip(), exit_code=r.returncode)
     except Exception as ex:
-        return -1, "", str(ex)
+        return RunGitException(exception=ex)
 
 
 def derive_git_env() -> dict[str, str]:
