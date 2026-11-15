@@ -33,6 +33,7 @@ import re
 import subprocess
 import urllib.request
 import urllib.error
+from typing import Any, TypedDict
 
 GIT_DIR = "/homeassistant"
 SSH_KEY = "/data/id_ed25519"
@@ -42,10 +43,60 @@ SUPERVISOR_TOKEN = os.environ.get("SUPERVISOR_TOKEN", "")
 BACKUP_NAME = "pre-deploy"
 
 
+# --- result contracts (mirror tests/test_contracts.py) ----------------------
+
+
+class ChangeDict(TypedDict):
+    status: str
+    path: str
+
+
+class StatusSummary(TypedDict):
+    fetch_ok: bool
+    fetch_error: str
+    status_ok: bool
+    status_error: str
+    branch: str
+    ahead: int
+    behind: int
+    changes: list[ChangeDict]
+    summary: str
+    gate_ok: bool
+
+
+class BackupResult(TypedDict):
+    ok: bool
+    slug: str | None
+    code: int
+    error: str | None
+
+
+class ControlResult(TypedDict):
+    ok: bool
+    code: int
+    error: str | None
+    info: object | None
+
+
+class PullResult(TypedDict):
+    ok: bool
+    rc: int
+    pull_output: str
+    error: str | None
+
+
+class VerifyResult(TypedDict):
+    ok: bool
+    modified: list[str]
+    error: str | None
+
+
 # --- infrastructure ---------------------------------------------------------
 
 
-def supervisor_request(method, path, data=None, timeout=30):
+def supervisor_request(
+    method: str, path: str, data: dict[str, Any] | None = None, timeout: float = 30
+) -> tuple[int, dict[str, Any]]:
     """Defensive Supervisor API call: returns (code, parsed_body); never raises.
 
     code=-1 on network/timeout errors (counts as fail). HTTPError bodies are
@@ -62,7 +113,7 @@ def supervisor_request(method, path, data=None, timeout=30):
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             status = resp.status
-            raw = resp.read().decode(errors="replace")
+            raw: str = resp.read().decode(errors="replace")
     except urllib.error.HTTPError as e:
         raw = ""
         try:
@@ -70,18 +121,20 @@ def supervisor_request(method, path, data=None, timeout=30):
         except Exception:
             pass
         try:
-            return e.code, json.loads(raw)
+            parsed: dict[str, Any] = json.loads(raw)
         except Exception:
             return e.code, {"error": "non-JSON error body", "raw": raw[:500]}
+        return e.code, parsed
     except Exception as e:
         return -1, {"error": str(e)}
     try:
-        return status, json.loads(raw)
+        parsed = json.loads(raw)
     except Exception:
         return status, {"error": "non-JSON response body", "raw": raw[:500]}
+    return status, parsed
 
 
-def run_git(args, env=None):
+def run_git(args: list[str], env: dict[str, str] | None = None) -> tuple[int, str, str]:
     """Run git in GIT_DIR. Returns (rc, stdout, stderr); never raises."""
     e = dict(os.environ)
     if env:
@@ -96,7 +149,7 @@ def run_git(args, env=None):
         return -1, "", str(ex)
 
 
-def derive_git_env():
+def derive_git_env() -> dict[str, str]:
     """GIT_SSH_COMMAND env for all git calls in this deploy, derived once.
 
     SSH key missing -> silent fallback to {} (decided, D3): the fetch then
@@ -109,7 +162,7 @@ def derive_git_env():
 # --- git state --------------------------------------------------------------
 
 
-def git_status_summary(env):
+def git_status_summary(env: dict[str, str]) -> StatusSummary:
     """git fetch origin + git status --porcelain=v1 -b; classifies the state."""
     rc, out, err = run_git(["fetch", "origin"], env=env)
     fetch_ok = (rc == 0)
@@ -119,8 +172,9 @@ def git_status_summary(env):
     status_ok = (rc2 == 0)
     status_error = err2 if not status_ok else ""
     branch = ""
-    ahead = behind = 0
-    changes = []
+    ahead = 0
+    behind = 0
+    changes: list[ChangeDict] = []
     for line in branch_out.splitlines():
         if line.startswith("##"):
             branch = line[2:].strip()
@@ -133,6 +187,7 @@ def git_status_summary(env):
         elif line.strip():
             changes.append({"status": line[:2].strip(), "path": line[3:].strip()})
 
+    summary: str
     if not fetch_ok:
         low = fetch_error.lower()
         if "permission" in low or "auth" in low or "host key" in low or "could not read" in low:
@@ -181,7 +236,7 @@ def git_status_summary(env):
     }
 
 
-def gate_check(env):
+def gate_check(env: dict[str, str]) -> tuple[bool, str, StatusSummary]:
     """Gate rule: fetch_ok AND status_ok AND ahead==0 AND no non-?? changes.
 
     Returns (ok, reason, status_dict).
@@ -201,22 +256,28 @@ def gate_check(env):
 # --- steps ------------------------------------------------------------------
 
 
-def create_backup():
+def create_backup() -> BackupResult:
     """POST /backups/new/full. Blocks until the backup is done (decided, D2).
 
     Returns {"ok", "slug", "code", "error"}.
     """
-    result = {"ok": False, "slug": None, "code": -1, "error": None}
+    result: BackupResult = {"ok": False, "slug": None, "code": -1, "error": None}
     try:
         print("DEPLOY: creating full backup", flush=True)
-        code, info = supervisor_request("POST", "/backups/new/full", {"name": BACKUP_NAME}, timeout=300)
+        code, info = supervisor_request(
+            "POST", "/backups/new/full", {"name": BACKUP_NAME}, timeout=300
+        )
         result["code"] = code
         if not (200 <= code < 300):
             result["error"] = f"backup API returned {code}: {info}"
             print(f"DEPLOY: backup failed code={code} info={info}", flush=True)
             return result
         data = info.get("data") if isinstance(info, dict) else None
-        slug = data.get("slug") or data.get("name") if isinstance(data, dict) else None
+        slug = (
+            (data.get("slug") or data.get("name"))
+            if isinstance(data, dict)
+            else None
+        )
         if not slug:
             result["error"] = f"backup API returned unexpected body (no slug): {info}"
             print(f"DEPLOY: backup body mismatch: {info}", flush=True)
@@ -231,12 +292,12 @@ def create_backup():
         return result
 
 
-def stop_core():
+def stop_core() -> ControlResult:
     """POST /core/stop - synchronous control call (2xx == stopped, no polling).
 
     Returns {"ok", "code", "error", "info"}.
     """
-    result = {"ok": False, "code": -1, "error": None, "info": None}
+    result: ControlResult = {"ok": False, "code": -1, "error": None, "info": None}
     try:
         code, info = supervisor_request("POST", "/core/stop", timeout=30)
         result["code"] = code
@@ -253,12 +314,12 @@ def stop_core():
         return result
 
 
-def start_core():
+def start_core() -> ControlResult:
     """POST /core/start - synchronous control call (2xx == started, no polling).
 
     Returns {"ok", "code", "error", "info"}.
     """
-    result = {"ok": False, "code": -1, "error": None, "info": None}
+    result: ControlResult = {"ok": False, "code": -1, "error": None, "info": None}
     try:
         code, info = supervisor_request("POST", "/core/start", timeout=30)
         result["code"] = code
@@ -275,12 +336,12 @@ def start_core():
         return result
 
 
-def pull(env):
+def pull(env: dict[str, str]) -> PullResult:
     """git pull. rc=0 AND no CONFLICT AND no error: in output -> ok.
 
     Returns {"ok", "rc", "pull_output", "error"}.
     """
-    result = {"ok": False, "rc": -1, "pull_output": "", "error": None}
+    result: PullResult = {"ok": False, "rc": -1, "pull_output": "", "error": None}
     try:
         print("DEPLOY: running git pull", flush=True)
         rc, out, err = run_git(["pull"], env=env)
@@ -299,12 +360,12 @@ def pull(env):
         return result
 
 
-def verify(env):
+def verify(env: dict[str, str]) -> VerifyResult:
     """Post-pull verify: git status --porcelain, zero non-?? lines -> ok.
 
     Returns {"ok", "modified", "error"}.
     """
-    result = {"ok": False, "modified": [], "error": None}
+    result: VerifyResult = {"ok": False, "modified": [], "error": None}
     try:
         rc, out, err = run_git(["status", "--porcelain"], env=env)
         if rc != 0:
@@ -329,7 +390,7 @@ def verify(env):
 # --- orchestrator -----------------------------------------------------------
 
 
-def deploy():
+def deploy() -> dict[str, Any]:
     """Single entrypoint. Straight-line steps; owns core_stopped + recovery."""
     print("DEPLOY: ===== deploy started =====", flush=True)
     env = derive_git_env()

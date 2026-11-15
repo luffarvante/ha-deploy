@@ -1,0 +1,6 @@
+[tool.mypy]
+# Target the Python in the app's base image (ghcr.io/hassio-addons/base 21.x
+# = Alpine 3.22 = Python 3.12). Dev-only tool; nothing here ships.
+python_version = "3.12"
+strict = true
+files = ["ha_deploy/rootfs/app/deploy.py"]
