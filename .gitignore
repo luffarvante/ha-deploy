@@ -8,6 +8,9 @@ __pycache__/
 # Local-only agent context (never tracked)
 .opencode/
 
+# Dev environment (never tracked)
+.venv/
+
 
 .idea
 

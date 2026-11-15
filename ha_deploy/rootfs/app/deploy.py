@@ -115,7 +115,9 @@ def git_status_summary(env):
     fetch_ok = (rc == 0)
     fetch_error = err if not fetch_ok else ""
 
-    rc2, branch_out, _ = run_git(["status", "--porcelain=v1", "-b"], env=env)
+    rc2, branch_out, err2 = run_git(["status", "--porcelain=v1", "-b"], env=env)
+    status_ok = (rc2 == 0)
+    status_error = err2 if not status_ok else ""
     branch = ""
     ahead = behind = 0
     changes = []
@@ -137,6 +139,8 @@ def git_status_summary(env):
             summary = "auth error"
         else:
             summary = "fetch failed"
+    elif not status_ok:
+        summary = "status failed"
     elif ahead > 0 and behind > 0:
         summary = "diverged"
     elif behind > 0:
@@ -156,12 +160,18 @@ def git_status_summary(env):
         else:
             summary = "contains updates"
 
-    # gate: deploy allowed only if fetch_ok, ahead==0, no modified tracked files
-    gate_ok = fetch_ok and ahead == 0 and not any(c["status"] != "??" for c in changes)
+    # gate: deploy allowed only if fetch_ok, status_ok, ahead==0, no modified tracked files
+    gate_ok = (
+        fetch_ok and status_ok
+        and ahead == 0
+        and not any(c["status"] != "??" for c in changes)
+    )
 
     return {
         "fetch_ok": fetch_ok,
         "fetch_error": fetch_error,
+        "status_ok": status_ok,
+        "status_error": status_error,
         "branch": branch,
         "ahead": ahead,
         "behind": behind,
@@ -172,13 +182,15 @@ def git_status_summary(env):
 
 
 def gate_check(env):
-    """Gate rule: fetch_ok AND ahead==0 AND no non-?? changes.
+    """Gate rule: fetch_ok AND status_ok AND ahead==0 AND no non-?? changes.
 
     Returns (ok, reason, status_dict).
     """
     st = git_status_summary(env)
     if not st["fetch_ok"]:
         return False, f"fetch failed: {st['fetch_error']}", st
+    if not st["status_ok"]:
+        return False, f"status failed: {st['status_error']}", st
     if st["ahead"] > 0:
         return False, "local is ahead of origin (unpushed commits) - resolve manually or publish first", st
     if any(c["status"] != "??" for c in st["changes"]):
