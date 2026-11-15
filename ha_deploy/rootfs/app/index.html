@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>HA Deploy</title></head>
+<body>
+  <h1>HA Deploy</h1>
+  <p>Status check runs automatically on load.</p>
+  <button id="refresh">Refresh status</button>
+  <span id="timer"></span>
+  <pre id="out">Loading...</pre>
+  <hr>
+  <button id="deploy" disabled>Deploy (pull config from Git to server)</button>
+  <span id="deploy-status"></span>
+  <pre id="deploy-out"></pre>
+  <hr>
+  <button id="btn">Create test file</button>
+  <pre id="out2"></pre>
+  <script>
+    let lastCheck = null;
+    let lastStatus = null;
+    function updateTimer() {
+      if (lastCheck) {
+        const s = Math.floor((Date.now() - lastCheck) / 1000);
+        document.getElementById('timer').textContent = ' (checked ' + s + 's ago)';
+      }
+    }
+    setInterval(updateTimer, 1000);
+    function setDeployEnabled(status) {
+      const btn = document.getElementById('deploy');
+      const gateOk = status && status.fetch_ok && status.ahead === 0
+        && !status.changes.some(c => c.status !== '??');
+      btn.disabled = !gateOk;
+      document.getElementById('deploy-status').textContent = gateOk
+        ? ' (ready)' : ' (gate not clean - deploy disabled)';
+    }
+    async function checkStatus() {
+      const out = document.getElementById('out');
+      out.textContent = 'Checking...';
+      try {
+        const r = await fetch('status');
+        const j = await r.json();
+        lastCheck = Date.now();
+        lastStatus = j;
+        updateTimer();
+        out.textContent = JSON.stringify(j, null, 2);
+        setDeployEnabled(j);
+      } catch (e) {
+        out.textContent = 'Error: ' + e;
+        document.getElementById('deploy').disabled = true;
+      }
+    }
+    document.getElementById('refresh').onclick = checkStatus;
+    document.getElementById('deploy').onclick = async () => {
+      if (!confirm('This will restart Home Assistant. Continue?')) return;
+      const btn = document.getElementById('deploy');
+      const out = document.getElementById('deploy-out');
+      btn.disabled = true;
+      out.textContent = 'Deploying (backup -> stop -> pull -> start)...';
+      try {
+        const r = await fetch('deploy', { method: 'POST' });
+        const j = await r.json();
+        out.textContent = JSON.stringify(j, null, 2);
+      } catch (e) {
+        out.textContent = 'Error: ' + e;
+      }
+      await checkStatus();
+    };
+    document.getElementById('btn').onclick = async () => {
+      const out = document.getElementById('out2');
+      out.textContent = 'Working...';
+      try {
+        const r = await fetch('create', { method: 'POST' });
+        const j = await r.json();
+        out.textContent = JSON.stringify(j, null, 2);
+      } catch (e) {
+        out.textContent = 'Error: ' + e;
+      }
+    };
+    checkStatus();
+  </script>
+</body>
+</html>
