@@ -5,8 +5,10 @@ FROM ${BUILD_FROM}
 # Set shell
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-# Install only what v1 needs
-RUN apk add --no-cache python3 git openssh-client
+# Install only what the app needs (pydantic is a runtime dependency: the
+# typed decoders run in the app, not just in tests)
+RUN apk add --no-cache python3 py3-pip git openssh-client && \
+    pip install --no-cache-dir --break-system-packages pydantic
 
 # Copy root filesystem (S6 service + app)
 COPY rootfs /
