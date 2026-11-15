@@ -7,6 +7,8 @@ import urllib.request
 import urllib.error
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+import deploy as deploy_module
+
 GIT_DIR = "/homeassistant"
 TEST_FILE = os.path.join(GIT_DIR, "ha-deploy-test.txt")
 SSH_KEY = "/data/id_ed25519"
@@ -280,7 +282,13 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/deploy":
-            result = self._do_deploy()
+            # deploy() never lets errors escape its steps; this catch is the
+            # last-resort guarantee that /deploy always answers with JSON.
+            try:
+                result = deploy_module.deploy()
+            except Exception as e:
+                print(f"DEPLOY: unexpected error (last-resort catch): {e!r}", flush=True)
+                result = {"ok": False, "error": f"unexpected server error: {e!r}"}
             data = json.dumps(result).encode()
             self.send_response(200 if result.get("ok") else 500)
             self.send_header("Content-Type", "application/json")
