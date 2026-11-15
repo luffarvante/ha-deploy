@@ -160,8 +160,6 @@ combine-as-imports = true
 split-on-trailing-comma = false
 
 [tool.ruff.lint.per-file-ignores]
-# Old _do_deploy still prints; the file shrinks at the deferred cleanup.
-"ha_deploy/rootfs/app/server.py" = ["T20"]
 # The app files are standalone scripts, not a package.
 "ha_deploy/rootfs/app/**" = ["INP001"]
 # Tests are documentation-free by choice; not a package.
