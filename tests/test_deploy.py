@@ -92,13 +92,15 @@ def test_gate1_blocks_before_backup(monkeypatch):
     counts = {}
     blocked = deploy.GateBlocked(
         reason="modified tracked files present - resolve manually first",
-        state=deploy.Clean(),
+        state=deploy.Clean(branch="main...origin/main"),
     )
     install_steps(monkeypatch, counts, gate_check=[blocked])
 
     result = deploy.deploy()
 
-    assert result == deploy.BlockedBeforeBackup(state=deploy.Clean())
+    assert result == deploy.BlockedBeforeBackup(
+        state=deploy.Clean(branch="main...origin/main")
+    )
     assert counts["order"] == ["gate_check"]
     assert counts["order"].count("start_core") == 0
 
@@ -129,12 +131,16 @@ def test_stop_failure_does_not_restart(monkeypatch):
 
 def test_gate2_failure_restarts_twice(monkeypatch):
     counts = {}
-    blocked = deploy.GateBlocked(reason="changed after stop", state=deploy.Clean())
+    blocked = deploy.GateBlocked(
+        reason="changed after stop", state=deploy.Clean(branch="main...origin/main")
+    )
     install_steps(monkeypatch, counts, gate_check=[deploy.GatePass(), blocked])
 
     result = deploy.deploy()
 
-    assert result == deploy.BlockedAfterStop(state=deploy.Clean(), backup="abc123")
+    assert result == deploy.BlockedAfterStop(
+        state=deploy.Clean(branch="main...origin/main"), backup="abc123"
+    )
     assert counts["order"].count("start_core") == 2
     assert counts["order"].count("pull") == 0
 

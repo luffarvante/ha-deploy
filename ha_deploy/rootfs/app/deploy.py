@@ -197,12 +197,14 @@ class Clean(BaseModel):
     """no local changes, in sync with origin."""
 
     kind: Literal["clean"] = "clean"
+    branch: str
 
 
 class UntrackedOnly(BaseModel):
     """only untracked files; deploys are allowed."""
 
     kind: Literal["untracked-only"] = "untracked-only"
+    branch: str
     changes: list[Change]
 
 
@@ -210,6 +212,7 @@ class OnlyAdditions(BaseModel):
     """only staged/unstaged additions; deploy blocked."""
 
     kind: Literal["only-additions"] = "only-additions"
+    branch: str
     changes: list[Change]
 
 
@@ -217,6 +220,7 @@ class OnlyDeletions(BaseModel):
     """only deletions; deploy blocked."""
 
     kind: Literal["only-deletions"] = "only-deletions"
+    branch: str
     changes: list[Change]
 
 
@@ -224,6 +228,7 @@ class ContainsUpdates(BaseModel):
     """mixed modifications; deploy blocked."""
 
     kind: Literal["contains-updates"] = "contains-updates"
+    branch: str
     changes: list[Change]
 
 
@@ -231,6 +236,7 @@ class Diverged(BaseModel):
     """local and origin have diverged; deploy blocked."""
 
     kind: Literal["diverged"] = "diverged"
+    branch: str
     ahead: int
     behind: int
 
@@ -239,6 +245,7 @@ class BehindOrigin(BaseModel):
     """origin is ahead; deploy allowed (pull brings it home)."""
 
     kind: Literal["behind-origin"] = "behind-origin"
+    branch: str
     behind: int
 
 
@@ -246,6 +253,7 @@ class AheadOfOrigin(BaseModel):
     """local is ahead (unpushed commits); deploy blocked."""
 
     kind: Literal["ahead-of-origin"] = "ahead-of-origin"
+    branch: str
     ahead: int
 
 
@@ -286,17 +294,6 @@ GitState = Annotated[
 ]
 
 
-class GitReport(BaseModel):
-    """What the two git calls saw.
-
-    branch is None exactly when no status output could be read (fetch/auth/
-    status failure) - a real absent state, not an empty string.
-    """
-
-    branch: str | None
-    state: GitState
-
-
 def _classify_fetch(stderr: str) -> FetchFailed | AuthError:
     low = stderr.lower()
     if (
@@ -309,8 +306,13 @@ def _classify_fetch(stderr: str) -> FetchFailed | AuthError:
     return FetchFailed(reason=stderr)
 
 
-def _classify_status(status_out: str) -> GitReport:
-    branch = None
+def _classify_status(status_out: str) -> GitState:
+    """Classify porcelain -b output; the branch comes from the ## line.
+
+    A missing ## line (unreachable in practice) is a status failure, never a
+    silent empty branch.
+    """
+    branch: str | None = None
     ahead = 0
     behind = 0
     changes: list[Change] = []
@@ -326,47 +328,45 @@ def _classify_status(status_out: str) -> GitReport:
         elif line.strip():
             changes.append(Change(status=line[:2].strip(), path=line[3:].strip()))
 
+    if branch is None:
+        return StatusFailed(reason="no branch line in status output")
+
     if ahead > 0 and behind > 0:
-        state: GitState = Diverged(ahead=ahead, behind=behind)
-    elif behind > 0:
-        state = BehindOrigin(behind=behind)
-    elif ahead > 0:
-        state = AheadOfOrigin(ahead=ahead)
-    elif not changes:
-        state = Clean()
-    else:
-        statuses = {c.status for c in changes}
-        if all(s == "??" for s in statuses):
-            state = UntrackedOnly(changes=changes)
-        elif all(s in ("A", "AM", "??") for s in statuses):
-            state = OnlyAdditions(changes=changes)
-        elif all(s in ("D", "AD") for s in statuses):
-            state = OnlyDeletions(changes=changes)
-        else:
-            state = ContainsUpdates(changes=changes)
+        return Diverged(branch=branch, ahead=ahead, behind=behind)
+    if behind > 0:
+        return BehindOrigin(branch=branch, behind=behind)
+    if ahead > 0:
+        return AheadOfOrigin(branch=branch, ahead=ahead)
+    if not changes:
+        return Clean(branch=branch)
 
-    return GitReport(branch=branch, state=state)
+    statuses = {c.status for c in changes}
+    if all(s == "??" for s in statuses):
+        return UntrackedOnly(branch=branch, changes=changes)
+    if all(s in ("A", "AM", "??") for s in statuses):
+        return OnlyAdditions(branch=branch, changes=changes)
+    if all(s in ("D", "AD") for s in statuses):
+        return OnlyDeletions(branch=branch, changes=changes)
+    return ContainsUpdates(branch=branch, changes=changes)
 
 
-def git_status_summary(env: dict[str, str]) -> GitReport:
+def git_status_summary(env: dict[str, str]) -> GitState:
     """Git fetch origin + git status --porcelain=v1 -b; classifies the state."""
     match run_git(["fetch", "origin"], env):
         case RunGitSuccess():
-            pass
+            match run_git(["status", "--porcelain=v1", "-b"], env):
+                case RunGitSuccess(stdout=stdout):
+                    return _classify_status(stdout)
+                case RunGitFailure(stdout=_, stderr=stderr):
+                    return StatusFailed(reason=stderr)
+                case RunGitException(reason=reason):
+                    return StatusFailed(reason=reason)
+                case never:
+                    assert_never(never)
         case RunGitFailure(stdout=_, stderr=stderr):
-            return GitReport(branch=None, state=_classify_fetch(stderr))
+            return _classify_fetch(stderr)
         case RunGitException(reason=reason):
-            return GitReport(branch=None, state=_classify_fetch(reason))
-        case never:
-            assert_never(never)
-
-    match run_git(["status", "--porcelain=v1", "-b"], env):
-        case RunGitSuccess(stdout=stdout):
-            return _classify_status(stdout)
-        case RunGitFailure(stdout=_, stderr=stderr):
-            return GitReport(branch=None, state=StatusFailed(reason=stderr))
-        case RunGitException(reason=reason):
-            return GitReport(branch=None, state=StatusFailed(reason=reason))
+            return _classify_fetch(reason)
         case never:
             assert_never(never)
 
@@ -416,7 +416,7 @@ def gate_verdict(state: GitState) -> GateVerdict:
 
 def gate_check(env: dict[str, str]) -> GateVerdict:
     """Gate rule: clean/untracked-only/behind pass; everything else blocks."""
-    return gate_verdict(git_status_summary(env).state)
+    return gate_verdict(git_status_summary(env))
 
 
 # --- steps -------------------------------------------------------------------
@@ -863,13 +863,13 @@ def deploy() -> DeployOutcome:
 
 
 class StatusView(BaseModel):
-    """What /status serves: the report plus the gate verdict over its state."""
+    """What /status serves: the state plus the gate verdict over it."""
 
-    report: GitReport
+    state: GitState
     gate: GateVerdict
 
 
 def status_view(env: dict[str, str]) -> StatusView:
-    """One git pass, both consumers: the report plus the gate over its state."""
-    report = git_status_summary(env)
-    return StatusView(report=report, gate=gate_verdict(report.state))
+    """One git pass, both consumers: the state plus the gate over it."""
+    state = git_status_summary(env)
+    return StatusView(state=state, gate=gate_verdict(state))

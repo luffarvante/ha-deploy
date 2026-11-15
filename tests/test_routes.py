@@ -117,9 +117,9 @@ def test_status_serves_typed_view(api, monkeypatch):
     monkeypatch.setattr(deploy, "run_git", fake_run_git)
     status, body = json_request(api, "/status")
     assert status == 200
-    assert body["report"]["branch"] == "main...origin/main"
-    assert body["report"]["state"] == {
+    assert body["state"] == {
         "kind": "untracked-only",
+        "branch": "main...origin/main",
         "changes": [{"status": "??", "path": "t.txt"}],
     }
     assert body["gate"] == {"kind": "gate-pass"}
