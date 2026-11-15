@@ -17,6 +17,8 @@ Design decisions (from the plan):
     after a successful stop in try/finally.
   - The /deploy route adds one last-resort catch: guarantee a JSON response,
     log, no recovery.
+  - Logging uses the logging module (decided, Co): info for progress and
+    success, error for failures, warning for the finally safety net.
 
 Outcome mapping references (see plan):
   - Supervisor API calls: 2xx -> ok; non-2xx / network (code=-1) -> fail;
@@ -28,12 +30,15 @@ Outcome mapping references (see plan):
 """
 
 import json
+import logging
 import os
 import re
 import subprocess
 import urllib.request
 import urllib.error
 from typing import Any, TypedDict
+
+_LOGGER = logging.getLogger(__name__)
 
 GIT_DIR = "/homeassistant"
 SSH_KEY = "/data/id_ed25519"
@@ -263,14 +268,14 @@ def create_backup() -> BackupResult:
     """
     result: BackupResult = {"ok": False, "slug": None, "code": -1, "error": None}
     try:
-        print("DEPLOY: creating full backup", flush=True)
+        _LOGGER.info("DEPLOY: creating full backup")
         code, info = supervisor_request(
             "POST", "/backups/new/full", {"name": BACKUP_NAME}, timeout=300
         )
         result["code"] = code
         if not (200 <= code < 300):
             result["error"] = f"backup API returned {code}: {info}"
-            print(f"DEPLOY: backup failed code={code} info={info}", flush=True)
+            _LOGGER.error("DEPLOY: backup failed code=%s info=%s", code, info)
             return result
         data = info.get("data") if isinstance(info, dict) else None
         slug = (
@@ -280,15 +285,15 @@ def create_backup() -> BackupResult:
         )
         if not slug:
             result["error"] = f"backup API returned unexpected body (no slug): {info}"
-            print(f"DEPLOY: backup body mismatch: {info}", flush=True)
+            _LOGGER.error("DEPLOY: backup body mismatch: %s", info)
             return result
         result["ok"] = True
         result["slug"] = slug
-        print(f"DEPLOY: backup created slug={slug}", flush=True)
+        _LOGGER.info("DEPLOY: backup created slug=%s", slug)
         return result
     except Exception as ex:
         result["error"] = f"unexpected error in create_backup: {ex!r}"
-        print(f"DEPLOY: create_backup unexpected error: {ex!r}", flush=True)
+        _LOGGER.error("DEPLOY: create_backup unexpected error: %r", ex)
         return result
 
 
@@ -304,13 +309,13 @@ def stop_core() -> ControlResult:
         result["info"] = info
         if not (200 <= code < 300):
             result["error"] = f"core stop returned {code}: {info}"
-            print(f"DEPLOY: stop failed code={code} info={info}", flush=True)
+            _LOGGER.error("DEPLOY: stop failed code=%s info=%s", code, info)
             return result
         result["ok"] = True
         return result
     except Exception as ex:
         result["error"] = f"unexpected error in stop_core: {ex!r}"
-        print(f"DEPLOY: stop_core unexpected error: {ex!r}", flush=True)
+        _LOGGER.error("DEPLOY: stop_core unexpected error: %r", ex)
         return result
 
 
@@ -326,13 +331,13 @@ def start_core() -> ControlResult:
         result["info"] = info
         if not (200 <= code < 300):
             result["error"] = f"core start returned {code}: {info}"
-            print(f"DEPLOY: start failed code={code} info={info}", flush=True)
+            _LOGGER.error("DEPLOY: start failed code=%s info=%s", code, info)
             return result
         result["ok"] = True
         return result
     except Exception as ex:
         result["error"] = f"unexpected error in start_core: {ex!r}"
-        print(f"DEPLOY: start_core unexpected error: {ex!r}", flush=True)
+        _LOGGER.error("DEPLOY: start_core unexpected error: %r", ex)
         return result
 
 
@@ -343,12 +348,12 @@ def pull(env: dict[str, str]) -> PullResult:
     """
     result: PullResult = {"ok": False, "rc": -1, "pull_output": "", "error": None}
     try:
-        print("DEPLOY: running git pull", flush=True)
+        _LOGGER.info("DEPLOY: running git pull")
         rc, out, err = run_git(["pull"], env=env)
         pull_output = (out + ("\n" + err if err else "")).strip()
         result["rc"] = rc
         result["pull_output"] = pull_output
-        print(f"DEPLOY: git pull rc={rc} output={pull_output!r}", flush=True)
+        _LOGGER.info("DEPLOY: git pull rc=%s output=%r", rc, pull_output)
         if rc != 0 or "CONFLICT" in (out + err) or "error:" in (out + err).lower():
             result["error"] = "git pull failed"
             return result
@@ -356,7 +361,7 @@ def pull(env: dict[str, str]) -> PullResult:
         return result
     except Exception as ex:
         result["error"] = f"unexpected error in pull: {ex!r}"
-        print(f"DEPLOY: pull unexpected error: {ex!r}", flush=True)
+        _LOGGER.error("DEPLOY: pull unexpected error: %r", ex)
         return result
 
 
@@ -370,20 +375,20 @@ def verify(env: dict[str, str]) -> VerifyResult:
         rc, out, err = run_git(["status", "--porcelain"], env=env)
         if rc != 0:
             result["error"] = f"git status failed rc={rc}: {err}"
-            print(f"DEPLOY: verify failed: {result['error']}", flush=True)
+            _LOGGER.error("DEPLOY: verify failed: %s", result["error"])
             return result
         modified = [l for l in out.splitlines() if l.strip() and not l.startswith("??")]
         if modified:
             result["modified"] = modified
             result["error"] = "unexpected tracked changes after pull"
-            print(f"DEPLOY: unexpected tracked changes after pull: {modified}", flush=True)
+            _LOGGER.error("DEPLOY: unexpected tracked changes after pull: %s", modified)
             return result
-        print("DEPLOY: post-pull verify ok", flush=True)
+        _LOGGER.info("DEPLOY: post-pull verify ok")
         result["ok"] = True
         return result
     except Exception as ex:
         result["error"] = f"unexpected error in verify: {ex!r}"
-        print(f"DEPLOY: verify unexpected error: {ex!r}", flush=True)
+        _LOGGER.error("DEPLOY: verify unexpected error: %r", ex)
         return result
 
 
@@ -392,22 +397,24 @@ def verify(env: dict[str, str]) -> VerifyResult:
 
 def deploy() -> dict[str, Any]:
     """Single entrypoint. Straight-line steps; owns core_stopped + recovery."""
-    print("DEPLOY: ===== deploy started =====", flush=True)
+    _LOGGER.info("DEPLOY: ===== deploy started =====")
     env = derive_git_env()
 
     # Step 1: pre-stop gate check (gate #1). Fail -> return. Nothing stopped
     # yet, so no core action is needed.
-    print("DEPLOY: running pre-check (gate #1)", flush=True)
+    _LOGGER.info("DEPLOY: running pre-check (gate #1)")
     ok, reason, st = gate_check(env)
-    print(f"DEPLOY: gate #1 result: ok={ok} reason={reason}", flush=True)
+    _LOGGER.info("DEPLOY: gate #1 result: ok=%s reason=%s", ok, reason)
     if not ok:
-        print("DEPLOY: gate #1 failed - returning", flush=True)
+        _LOGGER.error("DEPLOY: gate #1 failed - returning")
         return {"ok": False, "error": f"gate failed: {reason}", "status": st}
-    print("DEPLOY: pre-check OK", flush=True)
+    _LOGGER.info("DEPLOY: pre-check OK")
 
     # Step 2: create HA backup. Fail -> return.
     b = create_backup()
-    print(f"DEPLOY: backup result: ok={b['ok']} slug={b['slug']} code={b['code']}", flush=True)
+    _LOGGER.info(
+        "DEPLOY: backup result: ok=%s slug=%s code=%s", b["ok"], b["slug"], b["code"]
+    )
     if not b["ok"]:
         return {"ok": False, "error": f"backup failed: {b['error']}", "backup": None}
     backup_slug = b["slug"]
@@ -416,9 +423,11 @@ def deploy() -> dict[str, Any]:
     try:
         # Step 3: stop HA core. Fail -> return with core_stopped=False.
         # Do NOT start: the core is presumably still running.
-        print("DEPLOY: stopping ha core", flush=True)
+        _LOGGER.info("DEPLOY: stopping ha core")
         s = stop_core()
-        print(f"DEPLOY: stop result: ok={s['ok']} code={s['code']} error={s['error']}", flush=True)
+        _LOGGER.info(
+            "DEPLOY: stop result: ok=%s code=%s error=%s", s["ok"], s["code"], s["error"]
+        )
         if not s["ok"]:
             return {"ok": False, "error": f"failed to stop core: {s['error']}", "backup": backup_slug}
         # Set immediately after a successful stop, BEFORE anything else, so any
@@ -426,44 +435,66 @@ def deploy() -> dict[str, Any]:
         core_stopped = True
 
         # Step 4: after-stop gate check (gate #2). Fail -> start, return.
-        print("DEPLOY: running after-stop check (gate #2)", flush=True)
+        _LOGGER.info("DEPLOY: running after-stop check (gate #2)")
         ok2, reason2, st2 = gate_check(env)
-        print(f"DEPLOY: after-stop check result: ok={ok2} reason={reason2}", flush=True)
+        _LOGGER.info(
+            "DEPLOY: after-stop check result: ok=%s reason=%s", ok2, reason2
+        )
         if not ok2:
-            print("DEPLOY: after-stop check was not fine, will return error but first will start ha core", flush=True)
+            _LOGGER.error(
+                "DEPLOY: after-stop check was not fine, will return error "
+                "but first will start ha core"
+            )
             r = start_core()
-            print(f"DEPLOY: restart result: ok={r['ok']} code={r['code']} error={r['error']}", flush=True)
+            _LOGGER.info(
+                "DEPLOY: restart result: ok=%s code=%s error=%s",
+                r["ok"], r["code"], r["error"],
+            )
             return {"ok": False, "error": f"post-stop gate failed: {reason2}", "status": st2, "backup": backup_slug}
 
         # Step 5: git pull. Fail -> start, return.
         p = pull(env)
-        print(f"DEPLOY: pull result: ok={p['ok']} rc={p['rc']}", flush=True)
+        _LOGGER.info("DEPLOY: pull result: ok=%s rc=%s", p["ok"], p["rc"])
         if not p["ok"]:
-            print("DEPLOY: pull was not fine, will return error but first will start ha core", flush=True)
+            _LOGGER.error(
+                "DEPLOY: pull was not fine, will return error "
+                "but first will start ha core"
+            )
             r = start_core()
-            print(f"DEPLOY: restart result: ok={r['ok']} code={r['code']} error={r['error']}", flush=True)
+            _LOGGER.info(
+                "DEPLOY: restart result: ok=%s code=%s error=%s",
+                r["ok"], r["code"], r["error"],
+            )
             return {"ok": False, "error": "git pull failed", "pull_output": p["pull_output"], "backup": backup_slug}
 
         # Step 6: post-pull verify. Fail -> start, return.
         v = verify(env)
-        print(f"DEPLOY: verify result: ok={v['ok']} modified={v['modified']}", flush=True)
+        _LOGGER.info("DEPLOY: verify result: ok=%s modified=%s", v["ok"], v["modified"])
         if not v["ok"]:
-            print("DEPLOY: verify was not fine, will return error but first will start ha core", flush=True)
+            _LOGGER.error(
+                "DEPLOY: verify was not fine, will return error "
+                "but first will start ha core"
+            )
             r = start_core()
-            print(f"DEPLOY: restart result: ok={r['ok']} code={r['code']} error={r['error']}", flush=True)
+            _LOGGER.info(
+                "DEPLOY: restart result: ok=%s code=%s error=%s",
+                r["ok"], r["code"], r["error"],
+            )
             return {"ok": False, "error": "unexpected tracked changes after pull",
                     "modified": v["modified"], "pull_output": p["pull_output"], "backup": backup_slug}
 
         # Step 7: start HA core. Fail -> return; core stays stopped and the
         # finally will still attempt a start.
-        print("DEPLOY: starting ha core", flush=True)
+        _LOGGER.info("DEPLOY: starting ha core")
         f = start_core()
-        print(f"DEPLOY: start result: ok={f['ok']} code={f['code']} error={f['error']}", flush=True)
+        _LOGGER.info(
+            "DEPLOY: start result: ok=%s code=%s error=%s", f["ok"], f["code"], f["error"]
+        )
         if not f["ok"]:
             return {"ok": False, "error": f"failed to start core: {f['error']}",
                     "pull_output": p["pull_output"], "backup": backup_slug}
         core_stopped = False
-        print("DEPLOY: ===== deploy finished OK =====", flush=True)
+        _LOGGER.info("DEPLOY: ===== deploy finished OK =====")
         return {"ok": True, "pull_output": p["pull_output"], "backup": backup_slug, "started": True}
 
     finally:
@@ -471,6 +502,9 @@ def deploy() -> dict[str, Any]:
         # broken-pipe from /health) - this exact gap is what broke the old
         # code, because core_stopped stayed False there.
         if core_stopped:
-            print("DEPLOY: finally - core was stopped, restarting", flush=True)
+            _LOGGER.warning("DEPLOY: finally - core was stopped, restarting")
             r = start_core()
-            print(f"DEPLOY: finally restart result: ok={r['ok']} code={r['code']} error={r['error']}", flush=True)
+            _LOGGER.warning(
+                "DEPLOY: finally restart result: ok=%s code=%s error=%s",
+                r["ok"], r["code"], r["error"],
+            )

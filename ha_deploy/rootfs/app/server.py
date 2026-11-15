@@ -8,6 +8,9 @@ import urllib.error
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import deploy as deploy_module
+import logging
+
+logging.basicConfig(format="%(levelname)s: %(message)s", level=logging.INFO)
 
 GIT_DIR = "/homeassistant"
 TEST_FILE = os.path.join(GIT_DIR, "ha-deploy-test.txt")
@@ -213,7 +216,9 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 result = deploy_module.deploy()
             except Exception as e:
-                print(f"DEPLOY: unexpected error (last-resort catch): {e!r}", flush=True)
+                logging.getLogger(__name__).exception(
+                    "DEPLOY: unexpected error (last-resort catch): %r", e
+                )
                 result = {"ok": False, "error": f"unexpected server error: {e!r}"}
             data = json.dumps(result).encode()
             self.send_response(200 if result.get("ok") else 500)
@@ -321,5 +326,5 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     httpd = HTTPServer(("0.0.0.0", PORT), Handler)
-    print(f"HA Deploy listening on {PORT}", flush=True)
+    logging.getLogger(__name__).info("HA Deploy listening on %s", PORT)
     httpd.serve_forever()
