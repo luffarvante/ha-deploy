@@ -1,7 +1,122 @@
 # HA Deploy — deploy flow design
 
-Status: design settled; not implemented. This document describes the target
-shape of the deploy flow before the next implementation round.
+Status: design settled; baseline app code is green; implementation not started.
+This document describes the target shape of the deploy flow before the next
+implementation round.
+
+## Implementation context
+
+### Repo state
+
+- Branch: `wip-deploy-with-tmp`.
+- HEAD: `6842455 Revert "adrian scratch"`. The branch is ahead of
+  `origin/wip-deploy-with-tmp` and has not been pushed.
+- The scratch commit `f4d8c6b` was reverted. The current app files are
+  `deploy.py`, `server.py`, and `index.html`.
+- The draft modules `deploy_scratch.py`, `types.py`, `ha_core_utils.py`,
+  `supervisor.py`, and `git_state.py` are gone. Their history remains available
+  if needed.
+- Existing plans:
+  - `~/.opencode/plan/plan.md` — deploy-flow behavior spec.
+  - `~/.opencode/plan/plan-typing.md` — typing round and addendum.
+- `AGENTS.md` still applies: never SSH; Adrian runs server inspection and
+  pushes; one decision at a time; commit after each step; keep the suite green.
+
+### Baseline and gate
+
+Run from the project root:
+
+```bash
+.venv/bin/basedpyright
+.venv/bin/ruff check .
+.venv/bin/ruff format --check .
+.venv/bin/python -m pytest tests/ -q
+```
+
+Current baseline:
+
+- `pytest`: 88 passed.
+- `basedpyright`: 0 errors, 636 warning-level diagnostics. The bare command
+  exits `1` because of the warnings; `--level error` exits `0`.
+- `ruff check`: passes.
+- `ruff format --check`: passes after `DESIGN.md` is formatted.
+- Dev venv: Python 3.10. App image: Alpine 3.22, Python 3.12.
+
+### Implementation order
+
+Stop after each step and wait for go-ahead before the next.
+
+1. Baseline check. Complete.
+2. Extract `supervisor.py`; update imports and tests. Behavior-preserving. Commit.
+3. Extract `git_state.py`; update imports and tests. Behavior-preserving. Commit.
+4. Extract `ha_core.py`; update imports and tests. Behavior-preserving. Commit.
+5. Rewrite the deploy core: `WindowOutcome`, new `DeployOutcome` fields,
+   phase functions, `_start_with_retry`, `_finish_success`, `_finish_blocked`,
+   and the single-restart/final-retry behavior. Update the orchestrator tests.
+   Commit.
+6. Update `server.py` and route tests for the new payload fields. UI changes
+   only if the new `restart`/`reason` data needs displaying. Commit.
+7. Cleanup and final verification: remove stale names and dead code, run the
+   full gate, commit.
+8. Report test count, basedpyright result, and ruff status. No push.
+
+Steps 2–4 are pure refactors. Step 5 is the behavior-changing commit.
+
+### Current behavior to replace
+
+| Path | Current `start_core()` calls |
+| --- | --- |
+| Happy path | 1 |
+| Gate2 / pull / verify blocked | 2 |
+| Final start failure | 2 |
+| Exception after stop | 1 |
+| Stop failure | 0 |
+| Before stop | 0 |
+
+The double start is caused by an explicit `_restart_core()` on the blocked
+path plus the `finally` safety net. It is not intentional “start twice” logic.
+The tests that pin it are `test_gate2_failure_restarts_twice`,
+`test_pull_failure_restarts_twice`, `test_verify_failure_restarts_twice`, and
+`test_final_start_failure_returns_but_finally_restarts`.
+
+### Server and retest
+
+- HAOS 18.4 amd64 at `192.168.0.30`; Core 2026.11.0; Supervisor 2026.10.5.
+- App 2026.3.1 is installed. The app source version is 2026.3.3.
+- Only the happy path has been validated end-to-end on the server.
+- After implementation: Adrian pushes, updates the app, and retests Deploy with
+  backup. No server access from the agent.
+
+### Prior decisions that must not be re-litigated
+
+- Typing round is complete: pydantic sum types at runtime, `match` with
+  `assert_never`, basedpyright `recommended` with
+  `reportMatchNotExhaustive = "error"`, no `T | None`, no boolean state.
+- `GitState` variants carry `branch`; `GitReport` is deleted; status is
+  `StatusView(state, gate)`.
+- `RunGitSuccess` keeps `stderr` because git writes progress there on rc=0;
+  `pull` folds stdout and stderr into its `output`. Stop/start fail on a 2xx
+  response with a non-JSON body; `UP035` is ignored because the dev venv is
+  Python 3.10.
+- `pydantic` is a runtime dependency installed in the Dockerfile.
+- Shared `CoreChangeFailed` and a generic `Result` wrapper were rejected in
+  favour of flat, per-operation unions.
+
+### Operational facts
+
+- Core stop/start control calls are synchronous. Measured: stop ~0.02 s, start
+  ~10.3 s.
+- `/backups/new/full` blocks until the backup completes.
+- `/core/info` has no `state` field; do not derive core state from it.
+- SSH git environment falls back silently to `{}` if the key is missing.
+- `git status` failure must fail the gate.
+- `pydantic-core` has musl wheels for amd64 and aarch64; no source build in the
+  image.
+
+### Reference pattern
+
+`~/development/python/kl-spec-queue` remains the reference for the Elm-style
+sum-type and `match` style described in `AGENTS.md`.
 
 ## Goals
 
@@ -17,6 +132,9 @@ The central rule:
 
 > "Core is stopped" is a phase, not a stored state. "Restart succeeded" is an
 > outcome, not a boolean.
+
+Runtime behavior stays unchanged except for the behavior deltas listed below;
+each delta is explicitly decided.
 
 ## Module layout
 
@@ -80,6 +198,15 @@ Owns the deploy vocabulary, phases, and presentation:
 
 Routes and serialization only. It calls `deploy.deploy()` and optionally
 `deploy.describe()`; it does not sequence phases.
+
+Current routes:
+
+- `GET /status` serves `StatusView`.
+- `POST /deploy` runs the deploy and serializes `DeployOutcome`.
+- `GET /health`, `GET /debug`, `GET /`, and `POST /create` also exist.
+
+`index.html` currently checks `view.gate.kind === "gate-pass"`; preserve that
+contract unless the UI is deliberately changed.
 
 ### Tests
 
@@ -400,9 +527,7 @@ def _start_with_retry() -> CoreStartResult:
             return CoreStarted()
 
         case CoreStartFailed(reason=reason):
-            _LOGGER.warning(
-                "DEPLOY: final start failed, retrying once: %s", reason
-            )
+            _LOGGER.warning("DEPLOY: final start failed, retrying once: %s", reason)
             return start_core()
 
         case never:
@@ -424,9 +549,7 @@ def _finish_success(
             return DeploySucceeded(output=output, backup=backup)
 
         case CoreStartFailed(reason=reason):
-            return BlockedByStart(
-                reason=reason, output=output, backup=backup
-            )
+            return BlockedByStart(reason=reason, output=output, backup=backup)
 
         case never:
             assert_never(never)
