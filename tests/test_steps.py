@@ -1,4 +1,4 @@
-"""Tests for the deploy steps: backup/stop/start/pull/verify outcome mapping."""
+"""Tests for the deploy steps: backup/pull/verify outcome mapping."""
 
 import deploy
 import git_state
@@ -123,82 +123,6 @@ def test_backup_request_posts_backup_name(monkeypatch):
     assert captured["path"] == "/backups/new/full"
     assert captured["body"] == {"name": "pre-deploy"}
     assert captured["timeout"] == 300
-
-
-# --- stop / start -------------------------------------------------------------
-
-
-def test_stop_ok(monkeypatch):
-    monkeypatch.setattr(
-        supervisor,
-        "supervisor_request",
-        fake_supervisor(supervisor.SupervisorOk(code=200, body={"result": "ok"})),
-    )
-    assert deploy.stop_core() == deploy.CoreStopped()
-
-
-def test_stop_api_error(monkeypatch):
-    monkeypatch.setattr(
-        supervisor,
-        "supervisor_request",
-        fake_supervisor(supervisor.SupervisorError(code=502, body={"result": "error"})),
-    )
-    outcome = deploy.stop_core()
-    assert isinstance(outcome, deploy.CoreStopFailed)
-    assert "502" in outcome.reason
-
-
-def test_stop_2xx_unexpected_body_fails(monkeypatch):
-    monkeypatch.setattr(
-        supervisor,
-        "supervisor_request",
-        fake_supervisor(supervisor.SupervisorBodyMismatch(code=200, raw="weird")),
-    )
-    outcome = deploy.stop_core()
-    assert isinstance(outcome, deploy.CoreStopFailed)
-    assert "non-JSON" in outcome.reason
-
-
-def test_stop_unreachable(monkeypatch):
-    monkeypatch.setattr(
-        supervisor,
-        "supervisor_request",
-        fake_supervisor(supervisor.SupervisorUnreachable(reason="timeout")),
-    )
-    outcome = deploy.stop_core()
-    assert isinstance(outcome, deploy.CoreStopFailed)
-    assert "unreachable" in outcome.reason
-
-
-def test_start_ok(monkeypatch):
-    monkeypatch.setattr(
-        supervisor,
-        "supervisor_request",
-        fake_supervisor(supervisor.SupervisorOk(code=200, body={"result": "ok"})),
-    )
-    assert deploy.start_core() == deploy.CoreStarted()
-
-
-def test_start_api_error(monkeypatch):
-    monkeypatch.setattr(
-        supervisor,
-        "supervisor_request",
-        fake_supervisor(supervisor.SupervisorError(code=500, body={"result": "error"})),
-    )
-    outcome = deploy.start_core()
-    assert isinstance(outcome, deploy.CoreStartFailed)
-    assert "500" in outcome.reason
-
-
-def test_start_unreachable(monkeypatch):
-    monkeypatch.setattr(
-        supervisor,
-        "supervisor_request",
-        fake_supervisor(supervisor.SupervisorUnreachable(reason="timeout")),
-    )
-    outcome = deploy.start_core()
-    assert isinstance(outcome, deploy.CoreStartFailed)
-    assert "unreachable" in outcome.reason
 
 
 # --- pull ---------------------------------------------------------------------

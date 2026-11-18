@@ -9,14 +9,15 @@ Everything below the /deploy route's last-resort catch returns sum types
 `match`); nothing raises. Failure is a variant, never a None or a flag.
 
 Design decisions (see plan-typing.md and AGENTS.md "Code style"):
-  - run_git maps subprocess outcomes into RunGitOutcome; git's exit code is
-    never read as a value (only zero/non-zero), so the variants carry the
-    streams only.
-  - supervisor_request maps HTTP/network outcomes into SupervisorOutcome;
-    the old code=-1 sentinel is gone - unreachable is its own variant.
+  - git_state.run_git maps subprocess outcomes into RunGitOutcome; git's exit
+    code is never read as a value (only zero/non-zero), so the variants carry
+    the streams only.
+  - supervisor.supervisor_request maps HTTP/network outcomes into
+    SupervisorOutcome; the old code=-1 sentinel is gone - unreachable is its
+    own variant.
   - Per-endpoint decoders turn the Supervisor envelope into typed outcomes.
-  - GitState's variants ARE the classifications; there is no summary string
-    and no gate_ok flag - the gate verdict is a match over the state.
+  - git_state.GitState's variants ARE the classifications; there is no summary
+    string and no gate_ok flag - the gate verdict is a match over the state.
   - deploy() returns one variant per flow-terminal point (DeployOutcome).
 """
 
@@ -24,6 +25,7 @@ import logging
 from typing import Annotated, Literal
 
 import git_state
+import ha_core
 from pydantic import BaseModel, Field, JsonValue, TypeAdapter, ValidationError
 import supervisor
 from typing_extensions import assert_never
@@ -113,76 +115,6 @@ def create_backup() -> BackupCreated | BackupFailed:
         case supervisor.SupervisorUnreachable(reason=reason):
             _LOGGER.error("DEPLOY: backup API unreachable: %s", reason)
             return BackupFailed(reason=f"backup API unreachable: {reason}")
-        case never:
-            assert_never(never)
-
-
-class CoreStopped(BaseModel):
-    """POST /core/stop answered 2xx."""
-
-    kind: Literal["core-stopped"] = "core-stopped"
-
-
-class CoreStopFailed(BaseModel):
-    """the core could not be stopped; reason carries the detail."""
-
-    kind: Literal["core-stop-failed"] = "core-stop-failed"
-    reason: str
-
-
-def stop_core() -> CoreStopped | CoreStopFailed:
-    """POST /core/stop - synchronous control call (2xx == stopped, no polling)."""
-    match supervisor.supervisor_request("POST", "/core/stop", None, timeout=30):
-        case supervisor.SupervisorOk():
-            return CoreStopped()
-        case supervisor.SupervisorError(code=code, body=body):
-            _LOGGER.error("DEPLOY: stop failed code=%s body=%s", code, body)
-            return CoreStopFailed(reason=f"core stop returned {code}: {body}")
-        case supervisor.SupervisorBodyMismatch(code=code, raw=raw):
-            _LOGGER.error(
-                "DEPLOY: stop failed code=%s with non-JSON body %r", code, raw
-            )
-            return CoreStopFailed(
-                reason=f"core stop returned {code} with a non-JSON body: {raw}"
-            )
-        case supervisor.SupervisorUnreachable(reason=reason):
-            _LOGGER.error("DEPLOY: stop failed, unreachable: %s", reason)
-            return CoreStopFailed(reason=f"core stop unreachable: {reason}")
-        case never:
-            assert_never(never)
-
-
-class CoreStarted(BaseModel):
-    """POST /core/start answered 2xx."""
-
-    kind: Literal["core-started"] = "core-started"
-
-
-class CoreStartFailed(BaseModel):
-    """the core could not be started; reason carries the detail."""
-
-    kind: Literal["core-start-failed"] = "core-start-failed"
-    reason: str
-
-
-def start_core() -> CoreStarted | CoreStartFailed:
-    """POST /core/start - synchronous control call (2xx == started, no polling)."""
-    match supervisor.supervisor_request("POST", "/core/start", None, timeout=30):
-        case supervisor.SupervisorOk():
-            return CoreStarted()
-        case supervisor.SupervisorError(code=code, body=body):
-            _LOGGER.error("DEPLOY: start failed code=%s body=%s", code, body)
-            return CoreStartFailed(reason=f"core start returned {code}: {body}")
-        case supervisor.SupervisorBodyMismatch(code=code, raw=raw):
-            _LOGGER.error(
-                "DEPLOY: start failed code=%s with non-JSON body %r", code, raw
-            )
-            return CoreStartFailed(
-                reason=f"core start returned {code} with a non-JSON body: {raw}"
-            )
-        case supervisor.SupervisorUnreachable(reason=reason):
-            _LOGGER.error("DEPLOY: start failed, unreachable: %s", reason)
-            return CoreStartFailed(reason=f"core start unreachable: {reason}")
         case never:
             assert_never(never)
 
@@ -356,13 +288,13 @@ DeployOutcome = Annotated[
 ]
 
 
-def _restart_core() -> CoreStarted | CoreStartFailed:
+def _restart_core() -> ha_core.CoreStarted | ha_core.CoreStartFailed:
     """start_core() with the old restart-result logging (recovery paths)."""
-    outcome = start_core()
+    outcome = ha_core.start_core()
     match outcome:
-        case CoreStarted():
+        case ha_core.CoreStarted():
             _LOGGER.info("DEPLOY: start result: ok")
-        case CoreStartFailed(reason=reason):
+        case ha_core.CoreStartFailed(reason=reason):
             _LOGGER.error("DEPLOY: start result: failed: %s", reason)
         case never:
             assert_never(never)
@@ -376,10 +308,10 @@ def _backup_taken_phase(backup: str, env: dict[str, str]) -> DeployOutcome:
         # Stop HA core. Fail -> return without starting: the core is
         # presumably still running (decided).
         _LOGGER.info("DEPLOY: stopping ha core")
-        match stop_core():
-            case CoreStopped():
+        match ha_core.stop_core():
+            case ha_core.CoreStopped():
                 core_stopped = True
-            case CoreStopFailed(reason=reason):
+            case ha_core.CoreStopFailed(reason=reason):
                 return BlockedByStop(reason=reason, backup=backup)
             case never:
                 assert_never(never)
@@ -404,14 +336,14 @@ def _backup_taken_phase(backup: str, env: dict[str, str]) -> DeployOutcome:
                     case VerifiedClean():
                         # Start HA core. Success clears the finally's restart.
                         _LOGGER.info("DEPLOY: starting ha core")
-                        match start_core():
-                            case CoreStarted():
+                        match ha_core.start_core():
+                            case ha_core.CoreStarted():
                                 core_stopped = False
                                 _LOGGER.info("DEPLOY: ===== deploy finished OK =====")
                                 return DeploySucceeded(
                                     output=pulled_output, backup=backup
                                 )
-                            case CoreStartFailed(reason=reason):
+                            case ha_core.CoreStartFailed(reason=reason):
                                 _LOGGER.error(
                                     "DEPLOY: start failed - returning: %s", reason
                                 )

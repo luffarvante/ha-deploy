@@ -8,6 +8,7 @@ pythonVersion = "3.12"
 include = [
   "ha_deploy/rootfs/app/deploy.py",
   "ha_deploy/rootfs/app/git_state.py",
+  "ha_deploy/rootfs/app/ha_core.py",
   "ha_deploy/rootfs/app/server.py",
   "ha_deploy/rootfs/app/supervisor.py",
   "tests",

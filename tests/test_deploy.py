@@ -2,6 +2,7 @@
 
 import deploy
 import git_state
+import ha_core
 import pytest
 
 ENV_SENTINEL = {"GIT_SSH_COMMAND": "sentinel"}
@@ -17,8 +18,8 @@ def install_steps(monkeypatch, counts, **overrides):
     defaults = {
         "gate_check": lambda env: git_state.GatePass(),
         "create_backup": lambda: deploy.BackupCreated(slug="abc123"),
-        "stop_core": lambda: deploy.CoreStopped(),
-        "start_core": lambda: deploy.CoreStarted(),
+        "stop_core": lambda: ha_core.CoreStopped(),
+        "start_core": lambda: ha_core.CoreStarted(),
         "pull": lambda env: deploy.Pulled(output="updated"),
         "verify": lambda env: deploy.VerifiedClean(),
     }
@@ -45,7 +46,12 @@ def install_steps(monkeypatch, counts, **overrides):
                 counts["order"].append(_name)
                 return _model
 
-        target = git_state if name == "gate_check" else deploy
+        targets = {
+            "gate_check": git_state,
+            "stop_core": ha_core,
+            "start_core": ha_core,
+        }
+        target = targets.get(name, deploy)
         monkeypatch.setattr(target, name, fake)
 
 
@@ -121,7 +127,9 @@ def test_backup_failure_returns_without_stopping(monkeypatch):
 
 def test_stop_failure_does_not_restart(monkeypatch):
     counts = {}
-    failed = deploy.CoreStopFailed(reason="core stop returned 502: {'result': 'error'}")
+    failed = ha_core.CoreStopFailed(
+        reason="core stop returned 502: {'result': 'error'}"
+    )
     install_steps(monkeypatch, counts, stop_core=failed)
 
     result = deploy.deploy()
@@ -177,7 +185,7 @@ def test_verify_failure_restarts_twice(monkeypatch):
 
 def test_final_start_failure_returns_but_finally_restarts(monkeypatch):
     counts = {}
-    failed = deploy.CoreStartFailed(
+    failed = ha_core.CoreStartFailed(
         reason="core start returned 500: {'result': 'error'}"
     )
     install_steps(monkeypatch, counts, start_core=failed)

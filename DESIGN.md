@@ -1,8 +1,7 @@
 # HA Deploy — deploy flow design
 
-Status: design settled; implementation in progress. `supervisor.py` and
-`git_state.py` are extracted; the deploy rewrite and remaining modules are
-pending.
+Status: design settled; implementation in progress. `supervisor.py`,
+`git_state.py`, and `ha_core.py` are extracted; the deploy rewrite is pending.
 
 ## Implementation context
 
