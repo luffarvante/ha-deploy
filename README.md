@@ -26,12 +26,13 @@ clean / only additions / only deletions / contains updates / untracked only /
 diverged / behind origin / auth error. Use **Refresh** to re-run; the
 "checked Xs ago" timer updates live.
 
-## Deploy button (v2026.3.0)
+## Deploy button (v2026.3.3)
 Click **Deploy (pull config from Git → server)** to pull the latest config
 from Git into the server. This triggers a full backup first, then stops HA,
-pulls, and restarts HA. The button is only enabled when the status check is
-clean (no unpushed commits, no modified tracked files). If anything fails,
-HA is restarted and the error is shown.
+pulls, and starts HA. If gate #2, the pull, or verify fails after HA stops, the
+app attempts one restart. If the final start fails, it retries once and reports
+that the core is not running. The button is only enabled when the status gate
+passes (no unpushed commits, no modified tracked files).
 
 ## Test button
 Click **Create test file**. This writes `/homeassistant/ha-deploy-test.txt` containing `OHAI`.

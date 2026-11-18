@@ -1,12 +1,15 @@
 """HA Deploy - clean deploy module, Elm-style.
 
 Implements the validated deploy flow:
-  gate #1 -> backup -> stop core -> gate #2 -> pull -> verify -> start core
-with a try/finally restart safety net.
+  gate #1 -> backup -> stop core -> gate #2 -> pull -> verify -> start core.
+The stopped-core window is explicit: a blocked body restarts the core once; a
+successful body uses a final start with one retry. Unexpected exceptions
+restart once and then re-raise to the route's last-resort catch.
 
 Everything below the /deploy route's last-resort catch returns sum types
 (pydantic models with a `kind` tag in discriminated unions, consumed via
-`match`); nothing raises. Failure is a variant, never a None or a flag.
+`match`). Flow failures are variants, never a None or a flag; unexpected
+exceptions are re-raised only after the stopped-core bracket.
 
 Design decisions (see plan-typing.md and AGENTS.md "Code style"):
   - git_state.run_git maps subprocess outcomes into RunGitOutcome; git's exit

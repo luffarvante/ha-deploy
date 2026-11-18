@@ -1,21 +1,18 @@
 # HA Deploy — deploy flow design
 
-Status: design settled; implementation in progress. `supervisor.py`,
-`git_state.py`, and `ha_core.py` are extracted; the deploy rewrite and route
-payload coverage are complete, and final cleanup is pending.
+Status: implemented on `wip-deploy-with-tmp`; not pushed. The full deploy flow
+still needs an end-to-end server retest.
 
 ## Implementation context
 
 ### Repo state
 
-- Branch: `wip-deploy-with-tmp`.
-- HEAD: `6842455 Revert "adrian scratch"`. The branch is ahead of
-  `origin/wip-deploy-with-tmp` and has not been pushed.
-- The scratch commit `f4d8c6b` was reverted. The current app files are
-  `deploy.py`, `server.py`, and `index.html`.
-- The draft modules `deploy_scratch.py`, `types.py`, `ha_core_utils.py`,
-  `supervisor.py`, and `git_state.py` are gone. Their history remains available
-  if needed.
+- Branch: `wip-deploy-with-tmp`; not pushed. See `git log` for the current tip.
+- The scratch commit `f4d8c6b` was reverted. The app files are `deploy.py`,
+  `git_state.py`, `ha_core.py`, `server.py`, `supervisor.py`, and `index.html`.
+- The draft modules `deploy_scratch.py`, `types.py`, and `ha_core_utils.py` are
+  gone. `supervisor.py` and `git_state.py` were reintroduced as the extracted
+  modules, not drafts. Their old history remains available if needed.
 - Existing plans:
   - `~/.opencode/plan/plan.md` — deploy-flow behavior spec.
   - `~/.opencode/plan/plan-typing.md` — typing round and addendum.
@@ -58,34 +55,34 @@ Stop after each step and wait for go-ahead before the next.
    tests. No `server.py` change was needed, and the UI already prints the full
    JSON object. Complete; commit.
 7. Cleanup and final verification: remove stale names and dead code, run the
-   full gate, commit.
+   full gate, commit. Complete.
 8. Report test count, basedpyright result, and ruff status. No push.
 
 Steps 2–4 are pure refactors. Step 5 is the behavior-changing commit.
 
-### Current behavior to replace
+### Behavior change (implemented)
 
-| Path | Current `start_core()` calls |
-| --- | --- |
-| Happy path | 1 |
-| Gate2 / pull / verify blocked | 2 |
-| Final start failure | 2 |
-| Exception after stop | 1 |
-| Stop failure | 0 |
-| Before stop | 0 |
+| Path | Before `start_core()` calls | After |
+| --- | --- | --- |
+| Happy path | 1 | 1 |
+| Gate2 / pull / verify blocked | 2 | 1 |
+| Final start failure | 2 | 2 (first + one explicit retry) |
+| Exception after stop | 1 | 1 |
+| Stop failure | 0 | 0 |
+| Before stop | 0 | 0 |
 
-The double start is caused by an explicit `_restart_core()` on the blocked
-path plus the `finally` safety net. It is not intentional “start twice” logic.
-The tests that pin it are `test_gate2_failure_restarts_twice`,
-`test_pull_failure_restarts_twice`, `test_verify_failure_restarts_twice`, and
-`test_final_start_failure_returns_but_finally_restarts`.
+The old double start on blocked paths came from an explicit `_restart_core()`
+plus the `finally` safety net. The new flow calls `start_core()` exactly once
+for a `GateBlocked`, `PullFailed`, or `VerifyFailed` body outcome. The old tests
+`*_restarts_twice` and `test_final_start_failure_returns_but_finally_restarts`
+were replaced.
 
 ### Server and retest
 
 - HAOS 18.4 amd64 at `192.168.0.30`; Core 2026.11.0; Supervisor 2026.10.5.
 - App 2026.3.1 is installed. The app source version is 2026.3.3.
 - Only the happy path has been validated end-to-end on the server.
-- After implementation: Adrian pushes, updates the app, and retests Deploy with
+- Next: Adrian pushes, updates the app, and retests the full Deploy flow with
   backup. No server access from the agent.
 
 ### Prior decisions that must not be re-litigated
@@ -185,9 +182,9 @@ action, not a state field.
 
 Owns the deploy vocabulary, phases, and presentation:
 
-- `BackupCreated`, `BackupFailed`, `BackupOutcome`
-- `Pulled`, `PullFailed`, `PullOutcome`
-- `VerifiedClean`, `VerifyFailed`, `VerifyOutcome`
+- `BackupCreated`, `BackupFailed`
+- `Pulled`, `PullFailed`
+- `VerifiedClean`, `VerifyFailed`
 - `WindowSucceeded`, `WindowOutcome`
 - `DeploySucceeded` and the `Blocked*` variants, `DeployOutcome`
 - `create_backup()`, `pull()`, `verify()`
@@ -215,12 +212,14 @@ Mirror the modules:
 
 - `test_supervisor.py`
 - `test_git_state.py`
+- `test_run_git.py`
 - `test_ha_core.py`
 - `test_deploy.py`
+- `test_steps.py`
 - `test_routes.py`
 
 Do not add `types.py`, `models.py`, or `errors.py` dumping grounds. Each module
-owns its own types. `deploy_scratch.py` and the current `types.py` sketch are not
+owns its own types. The old `deploy_scratch.py` and `types.py` sketches are not
 part of the design.
 
 ## Import rule
@@ -622,13 +621,13 @@ or serializes the result; `describe` stays side-effect free and unit-testable.
 
 ## Behavior deltas
 
-This design changes behavior in places that the current tests pin. Decisions
-1 and 2 are settled; implement them as described.
+This design changed behavior that the old tests pinned. Decisions 1 and 2 are
+settled and implemented as described.
 
-1. **One start on blocked exits, not two (decided).** The current code restarts
-   explicitly on blocked paths and then restarts again from `finally`. This
-   design calls `start_core()` exactly once for a `GateBlocked`, `PullFailed`,
-   or `VerifyFailed` body outcome. The corresponding tests move to `count == 1`.
+1. **One start on blocked exits, not two (decided).** The old code restarted
+   explicitly on blocked paths and then restarted again from `finally`. The new
+   flow calls `start_core()` exactly once for a `GateBlocked`, `PullFailed`, or
+   `VerifyFailed` body outcome. The corresponding tests assert `count == 1`.
 
 2. **One explicit retry after a failed final start (decided, R).** When
    `_window_steps` succeeds, `_start_with_retry()` calls `start_core()`; if that
