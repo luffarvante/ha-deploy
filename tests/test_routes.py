@@ -15,6 +15,7 @@ import urllib.request
 
 import deploy
 import git_state
+import ha_core
 import pytest
 import server
 
@@ -158,6 +159,92 @@ def test_deploy_route_failure_is_500_json(api, monkeypatch):
     assert body == {
         "kind": "blocked-by-backup",
         "reason": "backup API returned 500: {'result': 'error'}",
+    }
+
+
+def test_deploy_route_blocked_before_backup_serializes_reason(api, monkeypatch):
+    monkeypatch.setattr(
+        deploy,
+        "deploy",
+        lambda: deploy.BlockedBeforeBackup(
+            reason="modified tracked files present",
+            state=git_state.Clean(branch="main...origin/main"),
+        ),
+    )
+    status, body = json_request(api, "/deploy", method="POST")
+    assert status == 500
+    assert body == {
+        "kind": "blocked-before-backup",
+        "reason": "modified tracked files present",
+        "state": {"kind": "clean", "branch": "main...origin/main"},
+    }
+
+
+def test_deploy_route_blocked_after_stop_serializes_restart_failure(api, monkeypatch):
+    monkeypatch.setattr(
+        deploy,
+        "deploy",
+        lambda: deploy.BlockedAfterStop(
+            reason="changed after stop",
+            state=git_state.Clean(branch="main...origin/main"),
+            backup="abc123",
+            restart=ha_core.CoreStartFailed(reason="start failed"),
+        ),
+    )
+    status, body = json_request(api, "/deploy", method="POST")
+    assert status == 500
+    assert body == {
+        "kind": "blocked-after-stop",
+        "reason": "changed after stop",
+        "state": {"kind": "clean", "branch": "main...origin/main"},
+        "backup": "abc123",
+        "restart": {"kind": "core-start-failed", "reason": "start failed"},
+    }
+
+
+def test_deploy_route_blocked_by_pull_serializes_restart_success(api, monkeypatch):
+    monkeypatch.setattr(
+        deploy,
+        "deploy",
+        lambda: deploy.BlockedByPull(
+            reason="git pull failed",
+            output="CONFLICT (content)",
+            backup="abc123",
+            restart=ha_core.CoreStarted(),
+        ),
+    )
+    status, body = json_request(api, "/deploy", method="POST")
+    assert status == 500
+    assert body == {
+        "kind": "blocked-by-pull",
+        "reason": "git pull failed",
+        "output": "CONFLICT (content)",
+        "backup": "abc123",
+        "restart": {"kind": "core-started"},
+    }
+
+
+def test_deploy_route_blocked_by_verify_serializes_new_fields(api, monkeypatch):
+    monkeypatch.setattr(
+        deploy,
+        "deploy",
+        lambda: deploy.BlockedByVerify(
+            reason="unexpected tracked changes after pull",
+            output="updated",
+            modified=[" M config.py"],
+            backup="abc123",
+            restart=ha_core.CoreStarted(),
+        ),
+    )
+    status, body = json_request(api, "/deploy", method="POST")
+    assert status == 500
+    assert body == {
+        "kind": "blocked-by-verify",
+        "reason": "unexpected tracked changes after pull",
+        "output": "updated",
+        "modified": [" M config.py"],
+        "backup": "abc123",
+        "restart": {"kind": "core-started"},
     }
 
 
