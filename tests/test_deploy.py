@@ -6,6 +6,7 @@ import ha_core
 import pytest
 
 ENV_SENTINEL = {"GIT_SSH_COMMAND": "sentinel"}
+BRANCH = "main...origin/main"
 
 
 def install_steps(monkeypatch, counts, **overrides):
@@ -21,7 +22,7 @@ def install_steps(monkeypatch, counts, **overrides):
         "stop_core": lambda: ha_core.CoreStopped(),
         "start_core": lambda: ha_core.CoreStarted(),
         "pull": lambda env: deploy.Pulled(output="updated"),
-        "verify": lambda env: deploy.VerifiedClean(),
+        "verify": lambda env, output: deploy.VerifiedClean(),
     }
     monkeypatch.setattr(git_state, "derive_git_env", lambda: ENV_SENTINEL)
     for name, default in defaults.items():
@@ -55,7 +56,23 @@ def install_steps(monkeypatch, counts, **overrides):
         monkeypatch.setattr(target, name, fake)
 
 
-def test_happy_path_step_order_single_restart(monkeypatch):
+def install_start(monkeypatch, outcomes):
+    """Patch ha_core.start_core with a sequential outcome list."""
+    queue = list(outcomes)
+    calls = []
+
+    def fake():
+        calls.append(1)
+        return queue.pop(0)
+
+    monkeypatch.setattr(ha_core, "start_core", fake)
+    return calls
+
+
+# --- flow order and early returns --------------------------------------------
+
+
+def test_happy_path_step_order_single_start(monkeypatch):
     counts = {}
     install_steps(monkeypatch, counts)
 
@@ -85,7 +102,7 @@ def test_env_flows_to_git_steps(monkeypatch):
         seen["pull"] = env
         return deploy.Pulled(output="x")
 
-    def verify(env):
+    def verify(env, output):
         seen["verify"] = env
         return deploy.VerifiedClean()
 
@@ -100,14 +117,14 @@ def test_gate1_blocks_before_backup(monkeypatch):
     counts = {}
     blocked = git_state.GateBlocked(
         reason="modified tracked files present - resolve manually first",
-        state=git_state.Clean(branch="main...origin/main"),
+        state=git_state.Clean(branch=BRANCH),
     )
     install_steps(monkeypatch, counts, gate_check=[blocked])
 
     result = deploy.deploy()
 
     assert result == deploy.BlockedBeforeBackup(
-        state=git_state.Clean(branch="main...origin/main")
+        reason=blocked.reason, state=git_state.Clean(branch=BRANCH)
     )
     assert counts["order"] == ["gate_check"]
     assert counts["order"].count("start_core") == 0
@@ -139,23 +156,29 @@ def test_stop_failure_does_not_restart(monkeypatch):
     assert counts["order"].count("pull") == 0
 
 
-def test_gate2_failure_restarts_twice(monkeypatch):
+# --- blocked exits restart exactly once --------------------------------------
+
+
+def test_gate2_failure_restarts_once(monkeypatch):
     counts = {}
     blocked = git_state.GateBlocked(
-        reason="changed after stop", state=git_state.Clean(branch="main...origin/main")
+        reason="changed after stop", state=git_state.Clean(branch=BRANCH)
     )
     install_steps(monkeypatch, counts, gate_check=[git_state.GatePass(), blocked])
 
     result = deploy.deploy()
 
     assert result == deploy.BlockedAfterStop(
-        state=git_state.Clean(branch="main...origin/main"), backup="abc123"
+        reason=blocked.reason,
+        state=git_state.Clean(branch=BRANCH),
+        backup="abc123",
+        restart=ha_core.CoreStarted(),
     )
-    assert counts["order"].count("start_core") == 2
+    assert counts["order"].count("start_core") == 1
     assert counts["order"].count("pull") == 0
 
 
-def test_pull_failure_restarts_twice(monkeypatch):
+def test_pull_failure_restarts_once(monkeypatch):
     counts = {}
     failed = deploy.PullFailed(
         output="CONFLICT (content): Merge conflict in x", reason="git pull failed"
@@ -164,41 +187,253 @@ def test_pull_failure_restarts_twice(monkeypatch):
 
     result = deploy.deploy()
 
-    assert result == deploy.BlockedByPull(output=failed.output, backup="abc123")
-    assert counts["order"].count("start_core") == 2
+    assert result == deploy.BlockedByPull(
+        reason=failed.reason,
+        output=failed.output,
+        backup="abc123",
+        restart=ha_core.CoreStarted(),
+    )
+    assert counts["order"].count("start_core") == 1
 
 
-def test_verify_failure_restarts_twice(monkeypatch):
+def test_verify_failure_restarts_once(monkeypatch):
     counts = {}
     failed = deploy.VerifyFailed(
-        modified=[" M config.py"], reason="unexpected tracked changes after pull"
+        output="updated",
+        modified=[" M config.py"],
+        reason="unexpected tracked changes after pull",
     )
     install_steps(monkeypatch, counts, verify=failed)
 
     result = deploy.deploy()
 
     assert result == deploy.BlockedByVerify(
-        output="updated", modified=[" M config.py"], backup="abc123"
+        reason=failed.reason,
+        output="updated",
+        modified=[" M config.py"],
+        backup="abc123",
+        restart=ha_core.CoreStarted(),
     )
+    assert counts["order"].count("start_core") == 1
+
+
+def test_blocked_exit_restart_failure_is_recorded(monkeypatch):
+    counts = {}
+    failed = deploy.PullFailed(output="oops", reason="git pull failed")
+    restart_failed = ha_core.CoreStartFailed(reason="restart failed")
+    install_steps(monkeypatch, counts, pull=failed, start_core=restart_failed)
+
+    result = deploy.deploy()
+
+    assert result == deploy.BlockedByPull(
+        reason=failed.reason,
+        output=failed.output,
+        backup="abc123",
+        restart=restart_failed,
+    )
+    assert counts["order"].count("start_core") == 1
+
+
+# --- final start: one explicit retry ----------------------------------------
+
+
+def test_final_start_succeeds_without_retry(monkeypatch):
+    counts = {}
+    install_steps(monkeypatch, counts)
+
+    deploy.deploy()
+
+    assert counts["order"].count("start_core") == 1
+
+
+def test_final_start_failure_retries_and_succeeds(monkeypatch):
+    counts = {}
+    first = ha_core.CoreStartFailed(reason="core start returned 500")
+    install_steps(monkeypatch, counts, start_core=[first, ha_core.CoreStarted()])
+
+    result = deploy.deploy()
+
+    assert result == deploy.DeploySucceeded(output="updated", backup="abc123")
     assert counts["order"].count("start_core") == 2
 
 
-def test_final_start_failure_returns_but_finally_restarts(monkeypatch):
+def test_final_start_failure_twice_returns_blocked(monkeypatch):
     counts = {}
-    failed = ha_core.CoreStartFailed(
-        reason="core start returned 500: {'result': 'error'}"
-    )
-    install_steps(monkeypatch, counts, start_core=failed)
+    first = ha_core.CoreStartFailed(reason="core start returned 500")
+    second = ha_core.CoreStartFailed(reason="core start returned 502")
+    install_steps(monkeypatch, counts, start_core=[first, second])
 
     result = deploy.deploy()
 
     assert result == deploy.BlockedByStart(
-        reason=failed.reason, output="updated", backup="abc123"
+        reason=second.reason, output="updated", backup="abc123"
     )
     assert counts["order"].count("start_core") == 2
 
 
-def test_exception_after_stop_restarts_in_finally(monkeypatch):
+def test_start_with_retry_first_success(monkeypatch):
+    calls = install_start(monkeypatch, [ha_core.CoreStarted()])
+
+    assert deploy._start_with_retry() == ha_core.CoreStarted()
+    assert len(calls) == 1
+
+
+def test_start_with_retry_retry_succeeds(monkeypatch):
+    first = ha_core.CoreStartFailed(reason="first")
+    calls = install_start(monkeypatch, [first, ha_core.CoreStarted()])
+
+    assert deploy._start_with_retry() == ha_core.CoreStarted()
+    assert len(calls) == 2
+
+
+def test_start_with_retry_both_fail(monkeypatch):
+    first = ha_core.CoreStartFailed(reason="first")
+    second = ha_core.CoreStartFailed(reason="second")
+    calls = install_start(monkeypatch, [first, second])
+
+    assert deploy._start_with_retry() == second
+    assert len(calls) == 2
+
+
+# --- pure composition --------------------------------------------------------
+
+
+def test_finish_success_started():
+    outcome = deploy._finish_success("abc123", "updated", ha_core.CoreStarted())
+    assert outcome == deploy.DeploySucceeded(output="updated", backup="abc123")
+
+
+def test_finish_success_failed():
+    failed = ha_core.CoreStartFailed(reason="nope")
+    outcome = deploy._finish_success("abc123", "updated", failed)
+    assert outcome == deploy.BlockedByStart(
+        reason="nope", output="updated", backup="abc123"
+    )
+
+
+def test_finish_blocked_gate_started():
+    body = git_state.GateBlocked(reason="blocked", state=git_state.Clean(branch=BRANCH))
+    outcome = deploy._finish_blocked("abc123", body, ha_core.CoreStarted())
+    assert outcome == deploy.BlockedAfterStop(
+        reason="blocked",
+        state=git_state.Clean(branch=BRANCH),
+        backup="abc123",
+        restart=ha_core.CoreStarted(),
+    )
+
+
+def test_finish_blocked_gate_restart_failed():
+    body = git_state.GateBlocked(reason="blocked", state=git_state.Clean(branch=BRANCH))
+    failed = ha_core.CoreStartFailed(reason="restart failed")
+    outcome = deploy._finish_blocked("abc123", body, failed)
+    assert outcome == deploy.BlockedAfterStop(
+        reason="blocked",
+        state=git_state.Clean(branch=BRANCH),
+        backup="abc123",
+        restart=failed,
+    )
+
+
+def test_finish_blocked_pull_started():
+    body = deploy.PullFailed(output="pull out", reason="pull failed")
+    outcome = deploy._finish_blocked("abc123", body, ha_core.CoreStarted())
+    assert outcome == deploy.BlockedByPull(
+        reason="pull failed",
+        output="pull out",
+        backup="abc123",
+        restart=ha_core.CoreStarted(),
+    )
+
+
+def test_finish_blocked_pull_restart_failed():
+    body = deploy.PullFailed(output="pull out", reason="pull failed")
+    failed = ha_core.CoreStartFailed(reason="restart failed")
+    outcome = deploy._finish_blocked("abc123", body, failed)
+    assert outcome == deploy.BlockedByPull(
+        reason="pull failed",
+        output="pull out",
+        backup="abc123",
+        restart=failed,
+    )
+
+
+def test_finish_blocked_verify_started():
+    body = deploy.VerifyFailed(
+        output="pull out", modified=[" M x"], reason="verify failed"
+    )
+    outcome = deploy._finish_blocked("abc123", body, ha_core.CoreStarted())
+    assert outcome == deploy.BlockedByVerify(
+        reason="verify failed",
+        output="pull out",
+        modified=[" M x"],
+        backup="abc123",
+        restart=ha_core.CoreStarted(),
+    )
+
+
+def test_finish_blocked_verify_restart_failed():
+    body = deploy.VerifyFailed(
+        output="pull out", modified=[" M x"], reason="verify failed"
+    )
+    failed = ha_core.CoreStartFailed(reason="restart failed")
+    outcome = deploy._finish_blocked("abc123", body, failed)
+    assert outcome == deploy.BlockedByVerify(
+        reason="verify failed",
+        output="pull out",
+        modified=[" M x"],
+        backup="abc123",
+        restart=failed,
+    )
+
+
+# --- window steps ------------------------------------------------------------
+
+
+def test_window_steps_gate_blocked(monkeypatch):
+    counts = {}
+    blocked = git_state.GateBlocked(
+        reason="blocked", state=git_state.Clean(branch=BRANCH)
+    )
+    install_steps(monkeypatch, counts, gate_check=[blocked])
+
+    assert deploy._window_steps(ENV_SENTINEL) == blocked
+    assert counts["order"] == ["gate_check"]
+
+
+def test_window_steps_pull_failed(monkeypatch):
+    counts = {}
+    failed = deploy.PullFailed(output="pull out", reason="pull failed")
+    install_steps(monkeypatch, counts, pull=failed)
+
+    assert deploy._window_steps(ENV_SENTINEL) == failed
+    assert counts["order"] == ["gate_check", "pull"]
+
+
+def test_window_steps_verify_failed(monkeypatch):
+    counts = {}
+    failed = deploy.VerifyFailed(
+        output="updated", modified=[" M x"], reason="verify failed"
+    )
+    install_steps(monkeypatch, counts, verify=failed)
+
+    assert deploy._window_steps(ENV_SENTINEL) == failed
+    assert counts["order"] == ["gate_check", "pull", "verify"]
+
+
+def test_window_steps_success(monkeypatch):
+    counts = {}
+    install_steps(monkeypatch, counts)
+
+    assert deploy._window_steps(ENV_SENTINEL) == deploy.WindowSucceeded(
+        output="updated"
+    )
+    assert counts["order"] == ["gate_check", "pull", "verify"]
+
+
+# --- exception path ----------------------------------------------------------
+
+
+def test_exception_after_stop_restarts_once(monkeypatch):
     counts = {}
 
     def exploding_pull(env):
@@ -210,3 +445,75 @@ def test_exception_after_stop_restarts_in_finally(monkeypatch):
         deploy.deploy()
 
     assert counts["order"].count("start_core") == 1
+
+
+# --- presentation ------------------------------------------------------------
+
+
+def test_describe_exact_strings():
+    started = ha_core.CoreStarted()
+    failed = ha_core.CoreStartFailed(reason="nope")
+
+    assert (
+        deploy.describe(deploy.DeploySucceeded(output="updated", backup="abc123"))
+        == "ok"
+    )
+    assert (
+        deploy.describe(
+            deploy.BlockedBeforeBackup(
+                reason="gate failed", state=git_state.Clean(branch=BRANCH)
+            )
+        )
+        == "blocked before backup: gate failed"
+    )
+    assert deploy.describe(deploy.BlockedByBackup(reason="backup failed")) == (
+        "backup failed: backup failed"
+    )
+    assert deploy.describe(deploy.BlockedByStop(reason="stop failed", backup="b")) == (
+        "core stop failed: stop failed; no restart attempted"
+    )
+    assert (
+        deploy.describe(
+            deploy.BlockedAfterStop(
+                reason="gate failed",
+                state=git_state.Clean(branch=BRANCH),
+                backup="b",
+                restart=started,
+            )
+        )
+        == "gate failed; core restarted"
+    )
+    assert (
+        deploy.describe(
+            deploy.BlockedAfterStop(
+                reason="gate failed",
+                state=git_state.Clean(branch=BRANCH),
+                backup="b",
+                restart=failed,
+            )
+        )
+        == "gate failed; core restart failed: nope"
+    )
+    assert (
+        deploy.describe(
+            deploy.BlockedByPull(
+                reason="pull failed", output="o", backup="b", restart=started
+            )
+        )
+        == "pull failed: pull failed; core restarted"
+    )
+    assert (
+        deploy.describe(
+            deploy.BlockedByVerify(
+                reason="verify failed",
+                output="o",
+                modified=[],
+                backup="b",
+                restart=failed,
+            )
+        )
+        == "verify failed: verify failed; core restart failed: nope"
+    )
+    assert deploy.describe(
+        deploy.BlockedByStart(reason="start failed", output="o", backup="b")
+    ) == ("core start failed: start failed")

@@ -170,7 +170,7 @@ split-on-trailing-comma = false
 # The app files are standalone scripts, not a package.
 "ha_deploy/rootfs/app/**" = ["INP001"]
 # Tests are documentation-free by choice; not a package.
-"tests/**" = ["INP001", "D"]
+"tests/**" = ["INP001", "D", "SLF001"]
 
 [tool.ruff.lint.mccabe]
 max-complexity = 25

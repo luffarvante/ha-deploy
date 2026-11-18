@@ -198,7 +198,7 @@ def test_verify_only_untracked_is_clean(monkeypatch):
         "run_git",
         fake_run_git(git_state.RunGitSuccess(stdout="?? new.txt\n", stderr="")),
     )
-    assert deploy.verify({}) == deploy.VerifiedClean()
+    assert deploy.verify({}, "pulled output") == deploy.VerifiedClean()
 
 
 def test_verify_tracked_change_fails(monkeypatch):
@@ -209,8 +209,9 @@ def test_verify_tracked_change_fails(monkeypatch):
             git_state.RunGitSuccess(stdout=" M mod.txt\n?? new.txt\n", stderr="")
         ),
     )
-    outcome = deploy.verify({})
+    outcome = deploy.verify({}, "pulled output")
     assert isinstance(outcome, deploy.VerifyFailed)
+    assert outcome.output == "pulled output"
     assert outcome.modified == [" M mod.txt"]
     assert "unexpected tracked changes" in outcome.reason
 
@@ -221,7 +222,7 @@ def test_verify_deletion_fails(monkeypatch):
         "run_git",
         fake_run_git(git_state.RunGitSuccess(stdout="D  gone.txt", stderr="")),
     )
-    outcome = deploy.verify({})
+    outcome = deploy.verify({}, "pulled output")
     assert isinstance(outcome, deploy.VerifyFailed)
     assert outcome.modified == ["D  gone.txt"]
 
@@ -232,8 +233,9 @@ def test_verify_status_failure(monkeypatch):
         "run_git",
         fake_run_git(git_state.RunGitFailure(stdout="", stderr="fatal: bad object")),
     )
-    outcome = deploy.verify({})
+    outcome = deploy.verify({}, "pulled output")
     assert isinstance(outcome, deploy.VerifyFailed)
+    assert outcome.output == "pulled output"
     assert outcome.modified == []
     assert "fatal" in outcome.reason
 
@@ -244,6 +246,6 @@ def test_verify_exception(monkeypatch):
         "run_git",
         fake_run_git(git_state.RunGitException(reason="status exploded")),
     )
-    outcome = deploy.verify({})
+    outcome = deploy.verify({}, "pulled output")
     assert isinstance(outcome, deploy.VerifyFailed)
     assert "status exploded" in outcome.reason

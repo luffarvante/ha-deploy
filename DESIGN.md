@@ -1,7 +1,8 @@
 # HA Deploy — deploy flow design
 
 Status: design settled; implementation in progress. `supervisor.py`,
-`git_state.py`, and `ha_core.py` are extracted; the deploy rewrite is pending.
+`git_state.py`, and `ha_core.py` are extracted; the deploy rewrite is complete,
+and the server/route payload update is pending.
 
 ## Implementation context
 
@@ -34,8 +35,8 @@ Run from the project root:
 
 Current baseline:
 
-- `pytest`: 88 passed.
-- `basedpyright`: 0 errors, 636 warning-level diagnostics. The bare command
+- `pytest`: 107 passed.
+- `basedpyright`: 0 errors, 729 warning-level diagnostics. The bare command
   exits `1` because of the warnings; `--level error` exits `0`.
 - `ruff check`: passes.
 - `ruff format --check`: passes after `DESIGN.md` is formatted.
@@ -52,7 +53,7 @@ Stop after each step and wait for go-ahead before the next.
 5. Rewrite the deploy core: `WindowOutcome`, new `DeployOutcome` fields,
    phase functions, `_start_with_retry`, `_finish_success`, `_finish_blocked`,
    and the single-restart/final-retry behavior. Update the orchestrator tests.
-   Commit.
+   Complete; commit.
 6. Update `server.py` and route tests for the new payload fields. UI changes
    only if the new `restart`/`reason` data needs displaying. Commit.
 7. Cleanup and final verification: remove stale names and dead code, run the
@@ -344,6 +345,7 @@ class VerifiedClean(BaseModel):
 
 class VerifyFailed(BaseModel):
     kind: Literal["verify-failed"] = "verify-failed"
+    output: str
     modified: list[str]
     reason: str
 
