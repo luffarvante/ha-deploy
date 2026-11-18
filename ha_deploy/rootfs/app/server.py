@@ -11,13 +11,14 @@ import logging
 import os
 
 import deploy as deploy_module
+import git_state
 from typing_extensions import assert_never, override
 
 logging.basicConfig(format="%(levelname)s: %(message)s", level=logging.INFO)
 
-GIT_DIR = "/homeassistant"
+GIT_DIR = git_state.GIT_DIR
 TEST_FILE = os.path.join(GIT_DIR, "ha-deploy-test.txt")
-SSH_KEY = "/data/id_ed25519"
+SSH_KEY = git_state.SSH_KEY
 PORT = 8099
 
 # UI served at GET /. Read once at startup; a missing file fails fast here
@@ -57,7 +58,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(data)
             return
         if self.path == "/status":
-            result = deploy_module.status_view(deploy_module.derive_git_env())
+            result = git_state.status_view(git_state.derive_git_env())
             data = result.model_dump_json().encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")

@@ -1,6 +1,7 @@
 """Tests for the deploy steps: backup/stop/start/pull/verify outcome mapping."""
 
 import deploy
+import git_state
 import supervisor
 
 
@@ -205,19 +206,19 @@ def test_start_unreachable(monkeypatch):
 
 def test_pull_clean_output(monkeypatch):
     monkeypatch.setattr(
-        deploy,
+        git_state,
         "run_git",
-        fake_run_git(deploy.RunGitSuccess(stdout="Already up to date.", stderr="")),
+        fake_run_git(git_state.RunGitSuccess(stdout="Already up to date.", stderr="")),
     )
     assert deploy.pull({}) == deploy.Pulled(output="Already up to date.")
 
 
 def test_pull_success_with_conflict_marker_fails(monkeypatch):
     monkeypatch.setattr(
-        deploy,
+        git_state,
         "run_git",
         fake_run_git(
-            deploy.RunGitSuccess(
+            git_state.RunGitSuccess(
                 stdout="CONFLICT (content): Merge conflict in x", stderr=""
             )
         ),
@@ -230,9 +231,11 @@ def test_pull_success_with_conflict_marker_fails(monkeypatch):
 
 def test_pull_success_with_error_marker_fails(monkeypatch):
     monkeypatch.setattr(
-        deploy,
+        git_state,
         "run_git",
-        fake_run_git(deploy.RunGitSuccess(stdout="ok", stderr="error: something bad")),
+        fake_run_git(
+            git_state.RunGitSuccess(stdout="ok", stderr="error: something bad")
+        ),
     )
     outcome = deploy.pull({})
     assert isinstance(outcome, deploy.PullFailed)
@@ -241,7 +244,9 @@ def test_pull_success_with_error_marker_fails(monkeypatch):
 
 def test_pull_failure_combines_streams(monkeypatch):
     monkeypatch.setattr(
-        deploy, "run_git", fake_run_git(deploy.RunGitFailure(stdout="o", stderr="e"))
+        git_state,
+        "run_git",
+        fake_run_git(git_state.RunGitFailure(stdout="o", stderr="e")),
     )
     outcome = deploy.pull({})
     assert isinstance(outcome, deploy.PullFailed)
@@ -250,7 +255,9 @@ def test_pull_failure_combines_streams(monkeypatch):
 
 def test_pull_exception_empty_output(monkeypatch):
     monkeypatch.setattr(
-        deploy, "run_git", fake_run_git(deploy.RunGitException(reason="pull exploded"))
+        git_state,
+        "run_git",
+        fake_run_git(git_state.RunGitException(reason="pull exploded")),
     )
     outcome = deploy.pull({})
     assert isinstance(outcome, deploy.PullFailed)
@@ -263,19 +270,19 @@ def test_pull_exception_empty_output(monkeypatch):
 
 def test_verify_only_untracked_is_clean(monkeypatch):
     monkeypatch.setattr(
-        deploy,
+        git_state,
         "run_git",
-        fake_run_git(deploy.RunGitSuccess(stdout="?? new.txt\n", stderr="")),
+        fake_run_git(git_state.RunGitSuccess(stdout="?? new.txt\n", stderr="")),
     )
     assert deploy.verify({}) == deploy.VerifiedClean()
 
 
 def test_verify_tracked_change_fails(monkeypatch):
     monkeypatch.setattr(
-        deploy,
+        git_state,
         "run_git",
         fake_run_git(
-            deploy.RunGitSuccess(stdout=" M mod.txt\n?? new.txt\n", stderr="")
+            git_state.RunGitSuccess(stdout=" M mod.txt\n?? new.txt\n", stderr="")
         ),
     )
     outcome = deploy.verify({})
@@ -286,9 +293,9 @@ def test_verify_tracked_change_fails(monkeypatch):
 
 def test_verify_deletion_fails(monkeypatch):
     monkeypatch.setattr(
-        deploy,
+        git_state,
         "run_git",
-        fake_run_git(deploy.RunGitSuccess(stdout="D  gone.txt", stderr="")),
+        fake_run_git(git_state.RunGitSuccess(stdout="D  gone.txt", stderr="")),
     )
     outcome = deploy.verify({})
     assert isinstance(outcome, deploy.VerifyFailed)
@@ -297,9 +304,9 @@ def test_verify_deletion_fails(monkeypatch):
 
 def test_verify_status_failure(monkeypatch):
     monkeypatch.setattr(
-        deploy,
+        git_state,
         "run_git",
-        fake_run_git(deploy.RunGitFailure(stdout="", stderr="fatal: bad object")),
+        fake_run_git(git_state.RunGitFailure(stdout="", stderr="fatal: bad object")),
     )
     outcome = deploy.verify({})
     assert isinstance(outcome, deploy.VerifyFailed)
@@ -309,9 +316,9 @@ def test_verify_status_failure(monkeypatch):
 
 def test_verify_exception(monkeypatch):
     monkeypatch.setattr(
-        deploy,
+        git_state,
         "run_git",
-        fake_run_git(deploy.RunGitException(reason="status exploded")),
+        fake_run_git(git_state.RunGitException(reason="status exploded")),
     )
     outcome = deploy.verify({})
     assert isinstance(outcome, deploy.VerifyFailed)

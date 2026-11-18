@@ -1,6 +1,7 @@
 """Tests for the deploy() orchestrator: order, recovery, and flow outcomes."""
 
 import deploy
+import git_state
 import pytest
 
 ENV_SENTINEL = {"GIT_SSH_COMMAND": "sentinel"}
@@ -14,14 +15,14 @@ def install_steps(monkeypatch, counts, **overrides):
     """
     counts["order"] = []
     defaults = {
-        "gate_check": lambda env: deploy.GatePass(),
+        "gate_check": lambda env: git_state.GatePass(),
         "create_backup": lambda: deploy.BackupCreated(slug="abc123"),
         "stop_core": lambda: deploy.CoreStopped(),
         "start_core": lambda: deploy.CoreStarted(),
         "pull": lambda env: deploy.Pulled(output="updated"),
         "verify": lambda env: deploy.VerifiedClean(),
     }
-    monkeypatch.setattr(deploy, "derive_git_env", lambda: ENV_SENTINEL)
+    monkeypatch.setattr(git_state, "derive_git_env", lambda: ENV_SENTINEL)
     for name, default in defaults.items():
         seq = overrides.get(name, default)
 
@@ -44,7 +45,8 @@ def install_steps(monkeypatch, counts, **overrides):
                 counts["order"].append(_name)
                 return _model
 
-        monkeypatch.setattr(deploy, name, fake)
+        target = git_state if name == "gate_check" else deploy
+        monkeypatch.setattr(target, name, fake)
 
 
 def test_happy_path_step_order_single_restart(monkeypatch):
@@ -71,7 +73,7 @@ def test_env_flows_to_git_steps(monkeypatch):
 
     def gate(env):
         seen["gate"] = env
-        return deploy.GatePass()
+        return git_state.GatePass()
 
     def pull(env):
         seen["pull"] = env
@@ -90,16 +92,16 @@ def test_env_flows_to_git_steps(monkeypatch):
 
 def test_gate1_blocks_before_backup(monkeypatch):
     counts = {}
-    blocked = deploy.GateBlocked(
+    blocked = git_state.GateBlocked(
         reason="modified tracked files present - resolve manually first",
-        state=deploy.Clean(branch="main...origin/main"),
+        state=git_state.Clean(branch="main...origin/main"),
     )
     install_steps(monkeypatch, counts, gate_check=[blocked])
 
     result = deploy.deploy()
 
     assert result == deploy.BlockedBeforeBackup(
-        state=deploy.Clean(branch="main...origin/main")
+        state=git_state.Clean(branch="main...origin/main")
     )
     assert counts["order"] == ["gate_check"]
     assert counts["order"].count("start_core") == 0
@@ -131,15 +133,15 @@ def test_stop_failure_does_not_restart(monkeypatch):
 
 def test_gate2_failure_restarts_twice(monkeypatch):
     counts = {}
-    blocked = deploy.GateBlocked(
-        reason="changed after stop", state=deploy.Clean(branch="main...origin/main")
+    blocked = git_state.GateBlocked(
+        reason="changed after stop", state=git_state.Clean(branch="main...origin/main")
     )
-    install_steps(monkeypatch, counts, gate_check=[deploy.GatePass(), blocked])
+    install_steps(monkeypatch, counts, gate_check=[git_state.GatePass(), blocked])
 
     result = deploy.deploy()
 
     assert result == deploy.BlockedAfterStop(
-        state=deploy.Clean(branch="main...origin/main"), backup="abc123"
+        state=git_state.Clean(branch="main...origin/main"), backup="abc123"
     )
     assert counts["order"].count("start_core") == 2
     assert counts["order"].count("pull") == 0

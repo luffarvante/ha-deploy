@@ -14,6 +14,7 @@ import urllib.error
 import urllib.request
 
 import deploy
+import git_state
 import pytest
 import server
 
@@ -111,10 +112,12 @@ def test_create_writes_test_file(api, monkeypatch, tmp_path):
 def test_status_serves_typed_view(api, monkeypatch):
     def fake_run_git(args, env):
         if args[:2] == ["fetch", "origin"]:
-            return deploy.RunGitSuccess(stdout="", stderr="")
-        return deploy.RunGitSuccess(stdout="## main...origin/main\n?? t.txt", stderr="")
+            return git_state.RunGitSuccess(stdout="", stderr="")
+        return git_state.RunGitSuccess(
+            stdout="## main...origin/main\n?? t.txt", stderr=""
+        )
 
-    monkeypatch.setattr(deploy, "run_git", fake_run_git)
+    monkeypatch.setattr(git_state, "run_git", fake_run_git)
     status, body = json_request(api, "/status")
     assert status == 200
     assert body["state"] == {

@@ -1,8 +1,8 @@
 # HA Deploy — deploy flow design
 
-Status: design settled; baseline app code is green; implementation not started.
-This document describes the target shape of the deploy flow before the next
-implementation round.
+Status: design settled; implementation in progress. `supervisor.py` and
+`git_state.py` are extracted; the deploy rewrite and remaining modules are
+pending.
 
 ## Implementation context
 
@@ -143,7 +143,7 @@ supervisor.py  ->  no app-specific imports
 git_state.py   ->  subprocess only
 ha_core.py     ->  supervisor
 deploy.py      ->  git_state + ha_core + supervisor
-server.py      ->  deploy
+server.py      ->  deploy + git_state
 ```
 
 ### `supervisor.py`
