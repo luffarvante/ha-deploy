@@ -20,25 +20,20 @@ Design decisions (see plan-typing.md and AGENTS.md "Code style"):
   - deploy() returns one variant per flow-terminal point (DeployOutcome).
 """
 
-import contextlib
-import json
 import logging
 import os
 import re
 import subprocess
 from typing import Annotated, Literal
-import urllib.error
-import urllib.request
 
 from pydantic import BaseModel, Field, JsonValue, TypeAdapter, ValidationError
+import supervisor
 from typing_extensions import assert_never
 
 _LOGGER = logging.getLogger(__name__)
 
 GIT_DIR = "/homeassistant"
 SSH_KEY = "/data/id_ed25519"
-SUPERVISOR = "http://supervisor"
-SUPERVISOR_TOKEN = os.environ.get("SUPERVISOR_TOKEN", "")
 
 BACKUP_NAME = "pre-deploy"
 
@@ -73,85 +68,6 @@ RunGitOutcome = Annotated[
     RunGitSuccess | RunGitFailure | RunGitException,
     Field(discriminator="kind"),
 ]
-
-
-# --- supervisor boundary -----------------------------------------------------
-
-
-class SupervisorOk(BaseModel):
-    """2xx with a parseable JSON body."""
-
-    kind: Literal["ok"] = "ok"
-    code: int
-    body: JsonValue
-
-
-class SupervisorError(BaseModel):
-    """non-2xx with a parseable JSON body."""
-
-    kind: Literal["error"] = "error"
-    code: int
-    body: JsonValue
-
-
-class SupervisorBodyMismatch(BaseModel):
-    """the body was not JSON (any status code)."""
-
-    kind: Literal["body-mismatch"] = "body-mismatch"
-    code: int
-    raw: str
-
-
-class SupervisorUnreachable(BaseModel):
-    """the Supervisor API could not be reached at all (network, timeout)."""
-
-    kind: Literal["unreachable"] = "unreachable"
-    reason: str
-
-
-SupervisorOutcome = Annotated[
-    SupervisorOk | SupervisorError | SupervisorBodyMismatch | SupervisorUnreachable,
-    Field(discriminator="kind"),
-]
-
-
-def _parse_supervisor_body(code: int, raw: str) -> SupervisorOutcome:
-    try:
-        parsed: JsonValue = json.loads(raw)
-    except Exception:
-        return SupervisorBodyMismatch(code=code, raw=raw[:500])
-    if 200 <= code < 300:
-        return SupervisorOk(code=code, body=parsed)
-    return SupervisorError(code=code, body=parsed)
-
-
-def supervisor_request(
-    method: str, path: str, body: JsonValue | None, timeout: float
-) -> SupervisorOutcome:
-    """Defensive Supervisor API call: returns an outcome; never raises.
-
-    `body=None` is a real state: the request carries no JSON body. HTTPError
-    bodies are parsed so a non-2xx body reaches the log.
-    """
-    url = f"{SUPERVISOR}{path}"
-    headers = {"Authorization": f"Bearer {SUPERVISOR_TOKEN}"}
-    data = None
-    if body is not None:
-        data = json.dumps(body).encode()
-        headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            status = resp.status
-            raw: str = resp.read().decode(errors="replace")
-    except urllib.error.HTTPError as e:
-        raw = ""
-        with contextlib.suppress(Exception):
-            raw = e.read().decode(errors="replace")
-        return _parse_supervisor_body(e.code, raw)
-    except Exception as e:
-        return SupervisorUnreachable(reason=str(e))
-    return _parse_supervisor_body(status, raw)
 
 
 def run_git(args: list[str], env: dict[str, str]) -> RunGitOutcome:
@@ -473,10 +389,10 @@ class BackupFailed(BaseModel):
 def create_backup() -> BackupCreated | BackupFailed:
     """POST /backups/new/full. Blocks until the backup is done (decided, D2)."""
     _LOGGER.info("DEPLOY: creating full backup")
-    match supervisor_request(
+    match supervisor.supervisor_request(
         "POST", "/backups/new/full", {"name": BACKUP_NAME}, timeout=300
     ):
-        case SupervisorOk(code=_, body=body):
+        case supervisor.SupervisorOk(code=_, body=body):
             try:
                 slug = _backup_slug(body)
             except ValidationError:
@@ -486,17 +402,17 @@ def create_backup() -> BackupCreated | BackupFailed:
                 )
             _LOGGER.info("DEPLOY: backup created slug=%s", slug)
             return BackupCreated(slug=slug)
-        case SupervisorError(code=code, body=body):
+        case supervisor.SupervisorError(code=code, body=body):
             _LOGGER.error("DEPLOY: backup failed code=%s body=%s", code, body)
             return BackupFailed(reason=f"backup API returned {code}: {body}")
-        case SupervisorBodyMismatch(code=code, raw=raw):
+        case supervisor.SupervisorBodyMismatch(code=code, raw=raw):
             _LOGGER.error(
                 "DEPLOY: backup failed code=%s with non-JSON body %r", code, raw
             )
             return BackupFailed(
                 reason=f"backup API returned {code} with a non-JSON body: {raw}"
             )
-        case SupervisorUnreachable(reason=reason):
+        case supervisor.SupervisorUnreachable(reason=reason):
             _LOGGER.error("DEPLOY: backup API unreachable: %s", reason)
             return BackupFailed(reason=f"backup API unreachable: {reason}")
         case never:
@@ -518,20 +434,20 @@ class CoreStopFailed(BaseModel):
 
 def stop_core() -> CoreStopped | CoreStopFailed:
     """POST /core/stop - synchronous control call (2xx == stopped, no polling)."""
-    match supervisor_request("POST", "/core/stop", None, timeout=30):
-        case SupervisorOk():
+    match supervisor.supervisor_request("POST", "/core/stop", None, timeout=30):
+        case supervisor.SupervisorOk():
             return CoreStopped()
-        case SupervisorError(code=code, body=body):
+        case supervisor.SupervisorError(code=code, body=body):
             _LOGGER.error("DEPLOY: stop failed code=%s body=%s", code, body)
             return CoreStopFailed(reason=f"core stop returned {code}: {body}")
-        case SupervisorBodyMismatch(code=code, raw=raw):
+        case supervisor.SupervisorBodyMismatch(code=code, raw=raw):
             _LOGGER.error(
                 "DEPLOY: stop failed code=%s with non-JSON body %r", code, raw
             )
             return CoreStopFailed(
                 reason=f"core stop returned {code} with a non-JSON body: {raw}"
             )
-        case SupervisorUnreachable(reason=reason):
+        case supervisor.SupervisorUnreachable(reason=reason):
             _LOGGER.error("DEPLOY: stop failed, unreachable: %s", reason)
             return CoreStopFailed(reason=f"core stop unreachable: {reason}")
         case never:
@@ -553,20 +469,20 @@ class CoreStartFailed(BaseModel):
 
 def start_core() -> CoreStarted | CoreStartFailed:
     """POST /core/start - synchronous control call (2xx == started, no polling)."""
-    match supervisor_request("POST", "/core/start", None, timeout=30):
-        case SupervisorOk():
+    match supervisor.supervisor_request("POST", "/core/start", None, timeout=30):
+        case supervisor.SupervisorOk():
             return CoreStarted()
-        case SupervisorError(code=code, body=body):
+        case supervisor.SupervisorError(code=code, body=body):
             _LOGGER.error("DEPLOY: start failed code=%s body=%s", code, body)
             return CoreStartFailed(reason=f"core start returned {code}: {body}")
-        case SupervisorBodyMismatch(code=code, raw=raw):
+        case supervisor.SupervisorBodyMismatch(code=code, raw=raw):
             _LOGGER.error(
                 "DEPLOY: start failed code=%s with non-JSON body %r", code, raw
             )
             return CoreStartFailed(
                 reason=f"core start returned {code} with a non-JSON body: {raw}"
             )
-        case SupervisorUnreachable(reason=reason):
+        case supervisor.SupervisorUnreachable(reason=reason):
             _LOGGER.error("DEPLOY: start failed, unreachable: %s", reason)
             return CoreStartFailed(reason=f"core start unreachable: {reason}")
         case never:

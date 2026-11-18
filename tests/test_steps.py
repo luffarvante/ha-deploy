@@ -1,6 +1,7 @@
 """Tests for the deploy steps: backup/stop/start/pull/verify outcome mapping."""
 
 import deploy
+import supervisor
 
 
 def fake_supervisor(outcome):
@@ -22,10 +23,10 @@ def fake_run_git(outcome):
 
 def test_backup_success_slug(monkeypatch):
     monkeypatch.setattr(
-        deploy,
+        supervisor,
         "supervisor_request",
         fake_supervisor(
-            deploy.SupervisorOk(
+            supervisor.SupervisorOk(
                 code=200, body={"result": "ok", "data": {"slug": "e2b7a9c4"}}
             )
         ),
@@ -36,10 +37,10 @@ def test_backup_success_slug(monkeypatch):
 
 def test_backup_name_fallback_kept(monkeypatch):
     monkeypatch.setattr(
-        deploy,
+        supervisor,
         "supervisor_request",
         fake_supervisor(
-            deploy.SupervisorOk(
+            supervisor.SupervisorOk(
                 code=200, body={"result": "ok", "data": {"name": "pre-deploy"}}
             )
         ),
@@ -50,9 +51,9 @@ def test_backup_name_fallback_kept(monkeypatch):
 
 def test_backup_api_error(monkeypatch):
     monkeypatch.setattr(
-        deploy,
+        supervisor,
         "supervisor_request",
-        fake_supervisor(deploy.SupervisorError(code=500, body={"result": "error"})),
+        fake_supervisor(supervisor.SupervisorError(code=500, body={"result": "error"})),
     )
     outcome = deploy.create_backup()
     assert isinstance(outcome, deploy.BackupFailed)
@@ -61,10 +62,10 @@ def test_backup_api_error(monkeypatch):
 
 def test_backup_body_without_slug(monkeypatch):
     monkeypatch.setattr(
-        deploy,
+        supervisor,
         "supervisor_request",
         fake_supervisor(
-            deploy.SupervisorOk(code=200, body={"result": "ok", "data": {}})
+            supervisor.SupervisorOk(code=200, body={"result": "ok", "data": {}})
         ),
     )
     outcome = deploy.create_backup()
@@ -74,9 +75,9 @@ def test_backup_body_without_slug(monkeypatch):
 
 def test_backup_non_dict_body(monkeypatch):
     monkeypatch.setattr(
-        deploy,
+        supervisor,
         "supervisor_request",
-        fake_supervisor(deploy.SupervisorOk(code=200, body=[])),
+        fake_supervisor(supervisor.SupervisorOk(code=200, body=[])),
     )
     outcome = deploy.create_backup()
     assert isinstance(outcome, deploy.BackupFailed)
@@ -85,9 +86,9 @@ def test_backup_non_dict_body(monkeypatch):
 
 def test_backup_non_json_body(monkeypatch):
     monkeypatch.setattr(
-        deploy,
+        supervisor,
         "supervisor_request",
-        fake_supervisor(deploy.SupervisorBodyMismatch(code=502, raw="oops")),
+        fake_supervisor(supervisor.SupervisorBodyMismatch(code=502, raw="oops")),
     )
     outcome = deploy.create_backup()
     assert isinstance(outcome, deploy.BackupFailed)
@@ -96,9 +97,9 @@ def test_backup_non_json_body(monkeypatch):
 
 def test_backup_unreachable(monkeypatch):
     monkeypatch.setattr(
-        deploy,
+        supervisor,
         "supervisor_request",
-        fake_supervisor(deploy.SupervisorUnreachable(reason="timeout")),
+        fake_supervisor(supervisor.SupervisorUnreachable(reason="timeout")),
     )
     outcome = deploy.create_backup()
     assert isinstance(outcome, deploy.BackupFailed)
@@ -113,9 +114,9 @@ def test_backup_request_posts_backup_name(monkeypatch):
         captured["path"] = path
         captured["body"] = body
         captured["timeout"] = timeout
-        return deploy.SupervisorError(code=500, body={"result": "error"})
+        return supervisor.SupervisorError(code=500, body={"result": "error"})
 
-    monkeypatch.setattr(deploy, "supervisor_request", handler)
+    monkeypatch.setattr(supervisor, "supervisor_request", handler)
     deploy.create_backup()
     assert captured["method"] == "POST"
     assert captured["path"] == "/backups/new/full"
@@ -128,18 +129,18 @@ def test_backup_request_posts_backup_name(monkeypatch):
 
 def test_stop_ok(monkeypatch):
     monkeypatch.setattr(
-        deploy,
+        supervisor,
         "supervisor_request",
-        fake_supervisor(deploy.SupervisorOk(code=200, body={"result": "ok"})),
+        fake_supervisor(supervisor.SupervisorOk(code=200, body={"result": "ok"})),
     )
     assert deploy.stop_core() == deploy.CoreStopped()
 
 
 def test_stop_api_error(monkeypatch):
     monkeypatch.setattr(
-        deploy,
+        supervisor,
         "supervisor_request",
-        fake_supervisor(deploy.SupervisorError(code=502, body={"result": "error"})),
+        fake_supervisor(supervisor.SupervisorError(code=502, body={"result": "error"})),
     )
     outcome = deploy.stop_core()
     assert isinstance(outcome, deploy.CoreStopFailed)
@@ -148,9 +149,9 @@ def test_stop_api_error(monkeypatch):
 
 def test_stop_2xx_unexpected_body_fails(monkeypatch):
     monkeypatch.setattr(
-        deploy,
+        supervisor,
         "supervisor_request",
-        fake_supervisor(deploy.SupervisorBodyMismatch(code=200, raw="weird")),
+        fake_supervisor(supervisor.SupervisorBodyMismatch(code=200, raw="weird")),
     )
     outcome = deploy.stop_core()
     assert isinstance(outcome, deploy.CoreStopFailed)
@@ -159,9 +160,9 @@ def test_stop_2xx_unexpected_body_fails(monkeypatch):
 
 def test_stop_unreachable(monkeypatch):
     monkeypatch.setattr(
-        deploy,
+        supervisor,
         "supervisor_request",
-        fake_supervisor(deploy.SupervisorUnreachable(reason="timeout")),
+        fake_supervisor(supervisor.SupervisorUnreachable(reason="timeout")),
     )
     outcome = deploy.stop_core()
     assert isinstance(outcome, deploy.CoreStopFailed)
@@ -170,18 +171,18 @@ def test_stop_unreachable(monkeypatch):
 
 def test_start_ok(monkeypatch):
     monkeypatch.setattr(
-        deploy,
+        supervisor,
         "supervisor_request",
-        fake_supervisor(deploy.SupervisorOk(code=200, body={"result": "ok"})),
+        fake_supervisor(supervisor.SupervisorOk(code=200, body={"result": "ok"})),
     )
     assert deploy.start_core() == deploy.CoreStarted()
 
 
 def test_start_api_error(monkeypatch):
     monkeypatch.setattr(
-        deploy,
+        supervisor,
         "supervisor_request",
-        fake_supervisor(deploy.SupervisorError(code=500, body={"result": "error"})),
+        fake_supervisor(supervisor.SupervisorError(code=500, body={"result": "error"})),
     )
     outcome = deploy.start_core()
     assert isinstance(outcome, deploy.CoreStartFailed)
@@ -190,9 +191,9 @@ def test_start_api_error(monkeypatch):
 
 def test_start_unreachable(monkeypatch):
     monkeypatch.setattr(
-        deploy,
+        supervisor,
         "supervisor_request",
-        fake_supervisor(deploy.SupervisorUnreachable(reason="timeout")),
+        fake_supervisor(supervisor.SupervisorUnreachable(reason="timeout")),
     )
     outcome = deploy.start_core()
     assert isinstance(outcome, deploy.CoreStartFailed)

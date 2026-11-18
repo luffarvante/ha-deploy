@@ -5,7 +5,12 @@
 typeCheckingMode = "recommended"
 reportMatchNotExhaustive = "error"
 pythonVersion = "3.12"
-include = ["ha_deploy/rootfs/app/deploy.py", "ha_deploy/rootfs/app/server.py", "tests"]
+include = [
+  "ha_deploy/rootfs/app/deploy.py",
+  "ha_deploy/rootfs/app/server.py",
+  "ha_deploy/rootfs/app/supervisor.py",
+  "tests",
+]
 venvPath = "."
 venv = ".venv"
 # tests reach the app modules via the conftest sys.path hook.
