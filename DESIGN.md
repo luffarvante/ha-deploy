@@ -1,7 +1,7 @@
 # HA Deploy — deploy flow design
 
-Status: proposed, not implemented. This document describes the target shape of the
-deploy flow before the next implementation round.
+Status: design settled; not implemented. This document describes the target
+shape of the deploy flow before the next implementation round.
 
 ## Goals
 
@@ -72,7 +72,8 @@ Owns the deploy vocabulary, phases, and presentation:
 - `WindowSucceeded`, `WindowOutcome`
 - `DeploySucceeded` and the `Blocked*` variants, `DeployOutcome`
 - `create_backup()`, `pull()`, `verify()`
-- `_window_steps()`, `_stop_phase()`, `_after_stop()`, `_finish_after_body()`
+- `_window_steps()`, `_stop_phase()`, `_after_stop()`
+- `_start_with_retry()`, `_finish_success()`, `_finish_blocked()`
 - `deploy()`, `describe()`
 
 ### `server.py`
@@ -333,7 +334,8 @@ Core status is read from the variant and the `restart` result:
 - `BlockedAfterStop` / `BlockedByPull` / `BlockedByVerify` with
   `restart=CoreStarted` — error, core is running again.
 - Same variants with `restart=CoreStartFailed` — error, core is not running.
-- `BlockedByStart` — final start failed; core is not running.
+- `BlockedByStart` — final start failed, including one explicit retry; core is
+  not running.
 - `DeploySucceeded` — success; core is running.
 
 There is no boolean and no `CoreState` field.
@@ -366,8 +368,9 @@ def _stop_phase(backup: str, env: dict[str, str]) -> DeployOutcome:
             return _after_stop(backup, env)
 ```
 
-`_after_stop` is the bracket. The combination of body outcome and restart result
-is a separate pure function:
+`_after_stop` is the bracket. It runs the body, then either performs the final
+start (with one retry) or one recovery start. The combination functions are
+pure:
 
 ```python
 def _after_stop(backup: str, env: dict[str, str]) -> DeployOutcome:
@@ -377,28 +380,65 @@ def _after_stop(backup: str, env: dict[str, str]) -> DeployOutcome:
         start_core()
         raise
 
-    restart = start_core()
-    return _finish_after_body(backup, body, restart)
+    match body:
+        case WindowSucceeded(output=output):
+            return _finish_success(backup, output, _start_with_retry())
+
+        case GateBlocked() | PullFailed() | VerifyFailed():
+            return _finish_blocked(backup, body, start_core())
+
+        case never:
+            assert_never(never)
+```
+
+`_start_with_retry` is the only place that retries a failed final start:
+
+```python
+def _start_with_retry() -> CoreStartResult:
+    match start_core():
+        case CoreStarted():
+            return CoreStarted()
+
+        case CoreStartFailed(reason=reason):
+            _LOGGER.warning(
+                "DEPLOY: final start failed, retrying once: %s", reason
+            )
+            return start_core()
+
+        case never:
+            assert_never(never)
+```
+
+If the first final start fails and the retry succeeds, the caller sees
+`CoreStarted`. If both fail, it sees `CoreStartFailed` carrying the retry's
+reason; the first reason is logged.
+
+```python
+def _finish_success(
+    backup: str,
+    output: str,
+    start: CoreStartResult,
+) -> DeployOutcome:
+    match start:
+        case CoreStarted():
+            return DeploySucceeded(output=output, backup=backup)
+
+        case CoreStartFailed(reason=reason):
+            return BlockedByStart(
+                reason=reason, output=output, backup=backup
+            )
+
+        case never:
+            assert_never(never)
 ```
 
 ```python
-def _finish_after_body(
+def _finish_blocked(
     backup: str,
-    body: WindowOutcome,
+    body: GateBlocked | PullFailed | VerifyFailed,
     restart: CoreStartResult,
 ) -> DeployOutcome:
     match body:
-        case WindowSucceeded(output=output):
-            match restart:
-                case CoreStarted():
-                    return DeploySucceeded(output=output, backup=backup)
-                case CoreStartFailed(reason=reason):
-                    return BlockedByStart(
-                        reason=reason, output=output, backup=backup
-                    )
-                case never:
-                    assert_never(never)
-
         case GateBlocked(reason=reason, state=state):
             return BlockedAfterStop(
                 reason=reason, state=state, backup=backup, restart=restart
@@ -422,8 +462,8 @@ def _finish_after_body(
             assert_never(never)
 ```
 
-`_finish_after_body` has no IO, no logging, and no state. It is covered by a
-small matrix: body success/failure × restart success/failure.
+`_finish_success` and `_finish_blocked` have no IO, no logging, and no state.
+They are covered by small matrices: success/failure × start/restart outcome.
 
 ## Printing
 
@@ -455,22 +495,28 @@ def describe(outcome: DeployOutcome) -> str:
 `_describe_restart` matches `CoreStarted` / `CoreStartFailed`. The route prints
 or serializes the result; `describe` stays side-effect free and unit-testable.
 
-## Behavior deltas requiring approval
+## Behavior deltas
 
-This design changes behavior in places that the current tests pin. These need
-explicit approval before implementation:
+This design changes behavior in places that the current tests pin. Decisions
+1 and 2 are settled; implement them as described.
 
-1. **One start on normal exits, not two.** The current code restarts explicitly
-   on blocked paths and then restarts again from `finally`. This design calls
-   `start_core()` exactly once after `_window_steps` on normal exits.
-2. **No implicit retry after a failed final start.** The current `finally` gives
-   the failed final start a second attempt. This design returns
-   `BlockedByStart` immediately. If a retry is wanted, it must be an explicit
-   policy with its own result.
+1. **One start on blocked exits, not two (decided).** The current code restarts
+   explicitly on blocked paths and then restarts again from `finally`. This
+   design calls `start_core()` exactly once for a `GateBlocked`, `PullFailed`,
+   or `VerifyFailed` body outcome. The corresponding tests move to `count == 1`.
+
+2. **One explicit retry after a failed final start (decided, R).** When
+   `_window_steps` succeeds, `_start_with_retry()` calls `start_core()`; if that
+   fails, it calls `start_core()` once more. A successful retry returns
+   `DeploySucceeded`; a second failure returns `BlockedByStart` with the retry's
+   reason. The first failure is logged. Blocked-exit recovery still starts only
+   once; the retry applies only to the final start.
+
 3. **Exception path.** An unexpected exception after a successful stop still
    triggers one best-effort `start_core()` and then re-raises. The restart result
    is not returned because the exception path exits through the route's
    last-resort catch.
+
 4. **More error detail in JSON.** `reason` is preserved on
    `BlockedBeforeBackup`, `BlockedAfterStop`, `BlockedByPull`, and
    `BlockedByVerify`; `restart` is added to the blocked-after-stop variants.
@@ -478,13 +524,17 @@ explicit approval before implementation:
 
 ## Testing strategy
 
-- `_finish_after_body`: pure matrix of body success/failure × restart
-  success/failure.
-- `_after_stop`: `_window_steps` normal/exception; assert `start_core` is called
-  exactly once on each normal exit and once on the exception path.
+- `_start_with_retry`: first start succeeds; first fails and retry succeeds;
+  both fail. Assert exactly two `start_core` calls only when the first fails.
+- `_finish_success`: pure matrix of `CoreStarted` / `CoreStartFailed` →
+  `DeploySucceeded` / `BlockedByStart`.
+- `_finish_blocked`: pure matrix of `GateBlocked` / `PullFailed` /
+  `VerifyFailed` × restart success/failure.
+- `_after_stop`: body success uses the retrying final start; blocked body uses
+  exactly one restart; exception path starts once and re-raises.
 - `_window_steps`: exact forwarding of `GateBlocked`, `PullFailed`, and
   `VerifyFailed`; success carries the pull output.
 - Phase functions: one test per early-return point; assert no later step runs.
-- `describe`: exact strings for success, each blocked variant, and both restart
+- `describe`: exact strings for success, each blocked variant, and both start
   results.
 - Route tests: serialization only; no phase logic in `server.py`.
